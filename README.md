@@ -130,6 +130,10 @@ src/agentgate/
 
 Each agent controls its own prompt format and response parsing via `prepare_prompt()` and `parse_response()`, so the gateway doesn't need to change.
 
+## Deployment Guides
+
+- [QQ 平台接入指南（中文）](docs/qq-setup.md) — 通过 NapCat + OneBot V11 接入 QQ
+
 ## Gateway Commands
 
 | Command | Description | Access |
