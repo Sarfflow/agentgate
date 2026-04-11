@@ -109,11 +109,11 @@ class SessionManager:
         prefix = "private" if chat_type == "private" else "group"
         return f"{prefix}_{chat_id}"
 
-    def get_cc_session_id(self, key: str) -> str | None:
-        return self._sessions.get(key, {}).get("cc_session_id")
+    def get_agent_session_id(self, key: str) -> str | None:
+        return self._sessions.get(key, {}).get("agent_session_id")
 
-    def set_cc_session_id(self, key: str, session_id: str):
-        self._sessions.setdefault(key, {})["cc_session_id"] = session_id
+    def set_agent_session_id(self, key: str, session_id: str):
+        self._sessions.setdefault(key, {})["agent_session_id"] = session_id
         self._save()
 
     def update_stats(

@@ -1,6 +1,9 @@
 # Config with secrets
 config.yaml
 
+# Local drafts
+linuxdo-post.md
+
 # Runtime data
 data/
 workspace/

@@ -37,6 +37,24 @@ class AgentResult:
 
 
 @dataclass
+class PromptContext:
+    """Context the gateway passes to the agent for prompt assembly."""
+
+    pending_results: list[str] = field(default_factory=list)
+    group_context: str = ""
+    is_fork: bool = False
+    image_paths: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ResponseSegment:
+    """A parsed segment of agent output, ready for sending."""
+
+    type: str  # "text" or "render" (markdown to PNG)
+    content: str
+
+
+@dataclass
 class HistoryMessage:
     """A message from chat history."""
 

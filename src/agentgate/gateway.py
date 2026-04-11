@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from pathlib import Path
 
 import aiohttp
 
@@ -15,7 +14,7 @@ from .platforms.base import ChatPlatform
 from .response import ResponseSender
 from .security import RateLimiter, SecurityChecker
 from .session import SessionManager
-from .types import Message
+from .types import Message, PromptContext
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +116,9 @@ class Gateway:
         if not msgs:
             return
 
-        session_key = SessionManager.make_key(msgs[0].chat_type, msgs[0].chat_id)
+        session_key = SessionManager.make_key(
+            msgs[0].chat_type, msgs[0].chat_id
+        )
         fork = False
 
         if session_key in self._busy_since:
@@ -126,18 +127,35 @@ class Gateway:
                 - self._busy_since[session_key]
             )
             if elapsed < self._stall_timeout:
+                # Agent still within grace period — re-queue
                 self._queues.setdefault(dkey, []).extend(msgs)
                 if dkey not in self._timers:
                     self._timers[dkey] = asyncio.create_task(
                         self._debounce(dkey, short=True)
                     )
                 return
-            fork = True
-            logger.info(
-                "Session %s busy for %.0fs, forking",
-                session_key,
-                elapsed,
-            )
+
+            # Agent has been running too long
+            if self._agent.supports_fork:
+                fork = True
+                logger.info(
+                    "Session %s busy for %.0fs, forking",
+                    session_key,
+                    elapsed,
+                )
+            else:
+                # Agent can't fork — keep queuing until current run finishes
+                logger.info(
+                    "Session %s busy for %.0fs, agent doesn't support fork, re-queuing",
+                    session_key,
+                    elapsed,
+                )
+                self._queues.setdefault(dkey, []).extend(msgs)
+                if dkey not in self._timers:
+                    self._timers[dkey] = asyncio.create_task(
+                        self._debounce(dkey, short=True)
+                    )
+                return
 
         if not fork:
             self._busy_since[session_key] = asyncio.get_event_loop().time()
@@ -153,88 +171,62 @@ class Gateway:
                 self._debounce(dkey, short=True)
             )
 
-    async def _process(self, msgs: list[Message], *, fork_session: bool = False):
+    async def _process(
+        self, msgs: list[Message], *, fork_session: bool = False
+    ):
         first = msgs[0]
         last = msgs[-1]
         session_key = SessionManager.make_key(first.chat_type, first.chat_id)
 
-        # ── build prompt ────────────────────────────────────────
-        prompt = self._build_prompt(msgs)
+        # ── gather context (gateway concern) ────────────────────
+        user_prompt = self._build_prompt(msgs)
 
-        # Inject results from previously superseded tasks
-        pending = self._pending_results.pop(session_key, None)
-        if pending:
-            ctx_parts = []
-            for i, res_text in enumerate(pending, 1):
-                truncated = res_text[:2000]
-                if len(res_text) > 2000:
-                    truncated += "\n... (truncated)"
-                ctx_parts.append(f"--- Task {i} ---\n{truncated}")
-            joined = "\n\n".join(ctx_parts)
-            prompt = (
-                "[Previously forked tasks completed and were sent to the user. "
-                "Summary below for context. Do not resend.]\n"
-                f"{joined}\n"
-                "[End of forked task results]\n\n"
-                + prompt
-            )
+        pending = self._pending_results.pop(session_key, None) or []
 
-        # Inject group chat context
+        group_context = ""
         if first.chat_type == "group":
-            context = await self._fetch_group_context(first.chat_id)
-            if context:
-                prompt = (
-                    "[Group chat context (messages since last @bot)]\n"
-                    f"{context}\n"
-                    "[End of context]\n\n"
-                    + prompt
-                )
+            group_context = await self._fetch_group_context(first.chat_id)
 
-        if fork_session:
-            prompt = (
-                "[SYSTEM NOTE: A previous long-running task is still executing "
-                "in a separate process. DO NOT continue, restart, or reference "
-                "that task unless the user explicitly asks. Focus ONLY on the "
-                "new message below.]\n\n"
-                + prompt
-            )
-
-        # Download images
         all_urls = [u for m in msgs for u in m.images]
         img_paths: list[str] = []
         for url in all_urls:
             if p := await self._download_image(url, session_key):
                 img_paths.append(p)
-        if img_paths:
-            note = "\n".join(
-                f"[User sent image, saved to: {p} — use Read tool to view]"
-                for p in img_paths
-            )
-            prompt = f"{prompt}\n\n{note}" if prompt else note
+
+        # ── let agent assemble the final prompt ─────────────────
+        context = PromptContext(
+            pending_results=pending,
+            group_context=group_context,
+            is_fork=fork_session,
+            image_paths=img_paths,
+        )
+        prompt = self._agent.prepare_prompt(user_prompt, context)
 
         if not prompt.strip():
             return
 
         # ── run agent ───────────────────────────────────────────
         work_dir = self.session_mgr.get_work_dir(session_key)
-        cc_sid = self.session_mgr.get_cc_session_id(session_key)
+        sid = self.session_mgr.get_agent_session_id(session_key)
 
         result = await self._agent.run(
             prompt=prompt,
             work_dir=work_dir,
-            session_id=cc_sid,
+            session_id=sid,
             is_admin=first.is_admin,
             fork_session=fork_session,
         )
 
-        # Update session
-        if result.session_id and result.session_id != cc_sid:
-            self.session_mgr.set_cc_session_id(session_key, result.session_id)
+        # Update session ID
+        if result.session_id and result.session_id != sid:
+            self.session_mgr.set_agent_session_id(
+                session_key, result.session_id
+            )
 
         # If this was the OLD task and a fork has taken over, stash result
         if not fork_session and result.text:
-            current_sid = self.session_mgr.get_cc_session_id(session_key)
-            if current_sid and current_sid != cc_sid:
+            current_sid = self.session_mgr.get_agent_session_id(session_key)
+            if current_sid and current_sid != sid:
                 self._pending_results.setdefault(session_key, []).append(
                     result.text
                 )
@@ -255,15 +247,17 @@ class Gateway:
             model=result.model,
         )
 
+        # ── let agent parse response, then send ────────────────
+        segments = self._agent.parse_response(result.text)
         await self._response.send(
-            result.text,
+            segments,
             last.chat_id,
             last.chat_type,
             last.message_id,
             last.sender_id,
         )
 
-    # ── prompt building ─────────────────────────────────────────
+    # ── prompt building (gateway concern: merge debounced messages) ──
 
     @staticmethod
     def _build_prompt(msgs: list[Message]) -> str:
@@ -279,14 +273,13 @@ class Gateway:
                 parts.append(m.text)
         return "\n\n".join(parts)
 
-    # ── group context ───────────────────────────────────────────
+    # ── group context (gateway concern: fetch history, find cutoff) ──
 
     async def _fetch_group_context(self, chat_id: int) -> str:
         history = await self._platform.fetch_history(chat_id, limit=1000)
         if not history:
             return ""
 
-        # Find last interaction point (where someone @'d or replied to the bot)
         cutoff_idx = max(0, len(history) - 100)
         for i in range(len(history) - 2, -1, -1):
             if history[i].mentions_bot:

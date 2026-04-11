@@ -4,18 +4,26 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 
 from ..config import ClaudeCodeConfig
-from ..types import AgentResult
+from ..types import AgentResult, PromptContext, ResponseSegment
 
 logger = logging.getLogger(__name__)
 
+_RENDER_RE = re.compile(r"<!--render-->(.*?)<!--/render-->", re.DOTALL)
+
 
 class ClaudeCodeAgent:
+    supports_resume = True
+    supports_fork = True
+
     def __init__(self, config: ClaudeCodeConfig):
         self.config = config
         self._sem = asyncio.Semaphore(config.max_concurrent)
+
+    # ── Agent protocol: run ─────────────────────────────────────
 
     async def run(
         self,
@@ -97,10 +105,85 @@ class ClaudeCodeAgent:
         if stderr:
             logger.debug("Agent stderr: %s", stderr.decode()[:500])
 
-        return self._parse(stdout.decode(), session_id)
+        return self._parse_output(stdout.decode(), session_id)
+
+    # ── Agent protocol: prepare_prompt ──────────────────────────
+
+    def prepare_prompt(self, user_prompt: str, context: PromptContext) -> str:
+        """Assemble the final prompt using Claude Code's bracketed note format."""
+        parts: list[str] = []
+
+        if context.pending_results:
+            ctx_parts = []
+            for i, res_text in enumerate(context.pending_results, 1):
+                truncated = res_text[:2000]
+                if len(res_text) > 2000:
+                    truncated += "\n... (truncated)"
+                ctx_parts.append(f"--- Task {i} ---\n{truncated}")
+            joined = "\n\n".join(ctx_parts)
+            parts.append(
+                "[Previously forked tasks completed and were sent to the user. "
+                "Summary below for context. Do not resend.]\n"
+                f"{joined}\n"
+                "[End of forked task results]"
+            )
+
+        if context.group_context:
+            parts.append(
+                "[Group chat context (messages since last @bot)]\n"
+                f"{context.group_context}\n"
+                "[End of context]"
+            )
+
+        if context.is_fork:
+            parts.append(
+                "[SYSTEM NOTE: A previous long-running task is still executing "
+                "in a separate process. DO NOT continue, restart, or reference "
+                "that task unless the user explicitly asks. Focus ONLY on the "
+                "new message below.]"
+            )
+
+        parts.append(user_prompt)
+
+        if context.image_paths:
+            note = "\n".join(
+                f"[User sent image, saved to: {p} — use Read tool to view]"
+                for p in context.image_paths
+            )
+            parts.append(note)
+
+        return "\n\n".join(p for p in parts if p)
+
+    # ── Agent protocol: parse_response ──────────────────────────
+
+    def parse_response(self, text: str) -> list[ResponseSegment]:
+        """Parse CC output, splitting on <!--SPLIT--> and extracting <!--render--> blocks."""
+        if not text:
+            return []
+
+        segments: list[ResponseSegment] = []
+        for chunk in text.split("<!--SPLIT-->"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+
+            parts = _RENDER_RE.split(chunk)
+            is_render = False
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    is_render = not is_render
+                    continue
+                seg_type = "render" if is_render else "text"
+                segments.append(ResponseSegment(seg_type, part))
+                is_render = not is_render
+
+        return segments or [ResponseSegment("text", text)]
+
+    # ── stream-json parsing ─────────────────────────────────────
 
     @staticmethod
-    def _parse(raw: str, fallback_sid: str | None) -> AgentResult:
+    def _parse_output(raw: str, fallback_sid: str | None) -> AgentResult:
         r = AgentResult(session_id=fallback_sid)
 
         for line in raw.strip().splitlines():

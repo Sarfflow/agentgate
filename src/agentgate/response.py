@@ -1,18 +1,15 @@
-"""Response formatting and sending logic."""
+"""Response sending: takes parsed ResponseSegments and delivers them via the platform."""
 from __future__ import annotations
 
 import asyncio
 import logging
-import re
-from pathlib import Path
 
 from .platforms.base import ChatPlatform
 from .render import render_md_to_png
 from .session import SessionManager
+from .types import ResponseSegment
 
 logger = logging.getLogger(__name__)
-
-_RENDER_RE = re.compile(r"<!--render-->(.*?)<!--/render-->", re.DOTALL)
 
 
 class ResponseSender:
@@ -28,54 +25,24 @@ class ResponseSender:
 
     async def send(
         self,
-        text: str,
+        segments: list[ResponseSegment],
         chat_id: int,
         chat_type: str,
         reply_msg_id: int,
         sender_id: int,
     ):
-        if not text:
+        if not segments:
             return
 
-        segments = [s.strip() for s in text.split("<!--SPLIT-->") if s.strip()]
-
-        first = True
-        for seg in segments:
-            await self._send_segment(
-                seg,
-                chat_id,
-                chat_type,
-                reply_msg_id if first else None,
-                sender_id,
-            )
-            first = False
-            if len(segments) > 1:
-                await asyncio.sleep(0.5)
-
-    async def _send_segment(
-        self,
-        text: str,
-        chat_id: int,
-        chat_type: str,
-        reply_msg_id: int | None,
-        sender_id: int,
-    ):
-        """Parse <!--render-->...<!--/render--> blocks, send text and images."""
-        parts = _RENDER_RE.split(text)
-        is_render = False
-
         first_text = True
-        for part in parts:
-            part = part.strip()
-            if not part:
-                is_render = not is_render
-                continue
-
-            if is_render:
-                await self._send_rendered_image(part, chat_id, chat_type)
+        for i, seg in enumerate(segments):
+            if seg.type == "render":
+                await self._send_rendered_image(
+                    seg.content, chat_id, chat_type
+                )
             else:
                 await self._send_text(
-                    part,
+                    seg.content,
                     chat_id,
                     chat_type,
                     reply_msg_id if first_text else None,
@@ -83,7 +50,8 @@ class ResponseSender:
                 )
                 first_text = False
 
-            is_render = not is_render
+            if i < len(segments) - 1:
+                await asyncio.sleep(0.5)
 
     async def _send_text(
         self,
@@ -99,8 +67,11 @@ class ResponseSender:
 
         if chat_type == "group" and reply_msg_id is not None:
             await self.platform.send_text(
-                chat_id, chat_type, text,
-                reply_to=reply_msg_id, mention=sender_id,
+                chat_id,
+                chat_type,
+                text,
+                reply_to=reply_msg_id,
+                mention=sender_id,
             )
         else:
             await self.platform.send_text(chat_id, chat_type, text)

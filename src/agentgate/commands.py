@@ -59,7 +59,7 @@ class CommandHandler:
 
     def _format_session_info(self, session_key: str) -> str:
         stats = self.session_mgr.get_stats(session_key)
-        sid = stats.get("cc_session_id")
+        sid = stats.get("agent_session_id")
         if not sid:
             return f"[{session_key}] No active session"
 
