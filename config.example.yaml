@@ -1,0 +1,39 @@
+# agentgate configuration
+
+# ── Chat Platform ───────────────────────────────────────────────
+# OneBot V11 (NapCat, go-cqhttp, Lagrange, etc.)
+onebot:
+  ws_port: 8765                        # Our WS server port (platform connects to us)
+  http_api: "http://127.0.0.1:3000"   # Platform HTTP API
+  access_token: ""                     # Must match platform config
+
+# ── CLI Agent ───────────────────────────────────────────────────
+# Claude Code
+claude_code:
+  model: ""                            # Empty = agent's default
+  max_concurrent: 3                    # Max concurrent agent processes
+  timeout: 1800                        # Hard kill timeout (seconds)
+  max_budget: 5.0                      # USD per invocation
+  fallback_model: ""
+  extra_flags: []                      # Additional CLI flags
+
+# ── Security ────────────────────────────────────────────────────
+security:
+  admin_users: []                      # User IDs with full permissions
+  whitelist_users: []                  # Allowed users (empty = all)
+  whitelist_groups: []                 # Allowed groups (empty = all)
+
+# ── Gateway ─────────────────────────────────────────────────────
+gateway:
+  work_dir: "workspace"                # Agent workspace root
+  data_dir: "data"                     # Session persistence directory
+  debounce_seconds: 10.0               # Merge rapid messages within this window
+  stall_timeout: 180                   # Fork a new agent if busy longer than this
+  max_message_length: 4500             # Above this: send as forward message
+
+# ── Rate Limiting (per non-admin user) ──────────────────────────
+rate_limit:
+  max_messages: 30
+  window_seconds: 60
+
+log_level: "INFO"
