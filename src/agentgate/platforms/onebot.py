@@ -159,6 +159,14 @@ class OneBotPlatform:
                 reply_id = seg["data"].get("id")
                 if reply_id:
                     reply_context = await self._get_reply_text(int(reply_id))
+            elif seg["type"] == "forward":
+                fwd_id = seg["data"].get("id")
+                if fwd_id:
+                    fwd_lines, fwd_imgs = await self._expand_forward(fwd_id)
+                    text_parts.append(
+                        "[转发消息]\n" + "\n".join(fwd_lines)
+                    )
+                    image_urls.extend(fwd_imgs)
 
         text = "\n".join(text_parts)
         if reply_context:
@@ -180,6 +188,60 @@ class OneBotPlatform:
             reply_text=reply_context,
             is_bot_mentioned=is_at or is_reply,
         )
+
+    async def _expand_forward(
+        self, res_id: str, depth: int = 1, max_depth: int = 3
+    ) -> tuple[list[str], list[str]]:
+        """Expand a forward message into text lines and image URLs.
+
+        Returns (text_lines, image_urls). Recurses up to max_depth levels.
+        """
+        text_lines: list[str] = []
+        image_urls: list[str] = []
+
+        data = await self.call_api("get_forward_msg", message_id=res_id)
+        if not data:
+            text_lines.append("[转发消息: 获取失败]")
+            return text_lines, image_urls
+
+        messages = data.get("messages", data.get("message", []))
+        for node in messages:
+            # node format varies: could be wrapped in data or direct
+            content = node.get("content", node.get("message", []))
+            sender = node.get("sender", {})
+            nick = sender.get("nickname", "?")
+
+            parts: list[str] = []
+            for seg in (content if isinstance(content, list) else []):
+                seg_type = seg.get("type", "")
+                if seg_type == "text":
+                    t = seg.get("data", {}).get("text", "").strip()
+                    if t:
+                        parts.append(t)
+                elif seg_type == "image":
+                    url = seg.get("data", {}).get("url")
+                    if url:
+                        image_urls.append(url)
+                        parts.append("[图片]")
+                elif seg_type == "forward":
+                    nested_id = seg.get("data", {}).get("id")
+                    if nested_id and depth < max_depth:
+                        nested_text, nested_imgs = await self._expand_forward(
+                            nested_id, depth + 1, max_depth
+                        )
+                        image_urls.extend(nested_imgs)
+                        indent = "  " * depth
+                        parts.append(
+                            f"[转发消息]\n"
+                            + "\n".join(indent + l for l in nested_text)
+                        )
+                    else:
+                        parts.append("[转发消息: 嵌套过深]" if nested_id else "[转发消息]")
+
+            line = " ".join(parts) if parts else "[空]"
+            text_lines.append(f"{nick}: {line}")
+
+        return text_lines, image_urls
 
     async def _is_bot_message(self, message_id: int) -> bool:
         data = await self.call_api("get_msg", message_id=message_id)
@@ -204,6 +266,11 @@ class OneBotPlatform:
                     parts.append(t)
             elif seg_type == "image":
                 parts.append("[图片]")
+            elif seg_type == "forward":
+                fwd_id = seg.get("data", {}).get("id")
+                if fwd_id:
+                    fwd_lines, _ = await self._expand_forward(fwd_id)
+                    parts.append(f"[转发消息 {len(fwd_lines)}条]")
         content = " ".join(parts)
         if not content:
             return None
@@ -372,6 +439,13 @@ class OneBotPlatform:
                             )
                             if ru == self.self_id:
                                 reply_to_bot = True
+                elif seg_type == "forward":
+                    fwd_id = seg.get("data", {}).get("id")
+                    if fwd_id:
+                        fwd_lines, _ = await self._expand_forward(fwd_id)
+                        text_parts.append(
+                            f"[转发消息 {len(fwd_lines)}条]"
+                        )
 
             result.append(
                 HistoryMessage(
@@ -401,6 +475,11 @@ class OneBotPlatform:
                     text_parts.append(t)
             elif seg.get("type") == "image":
                 text_parts.append("[图片]")
+            elif seg.get("type") == "forward":
+                fwd_id = seg.get("data", {}).get("id")
+                if fwd_id:
+                    fwd_lines, _ = await self._expand_forward(fwd_id)
+                    text_parts.append(f"[转发消息 {len(fwd_lines)}条]")
 
         sender_id = int(sender.get("user_id", 0))
         return HistoryMessage(
