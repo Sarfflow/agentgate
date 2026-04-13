@@ -177,7 +177,20 @@ class SessionManager:
         return d
 
     def reset(self, key: str):
-        self._sessions.pop(key, None)
+        """Clear the current active agent session.
+
+        Preserves `known_sessions` so /resume after /new can still list the
+        past sessions for this chat. Stats are cleared because they were
+        aggregated against the now-closed session.
+        """
+        entry = self._sessions.get(key)
+        if not entry:
+            return
+        known = list(entry.get("known_sessions", []))
+        if known:
+            self._sessions[key] = {"known_sessions": known}
+        else:
+            self._sessions.pop(key, None)
         self._save()
 
     # ── inbox persistence (survive restart) ─────────────────────
