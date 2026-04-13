@@ -5,11 +5,18 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+from typing import AsyncIterator
 
 from ..config import ClaudeCodeConfig
-from ..types import AgentResult, PromptContext, ResponseSegment, SessionSummary
+from ..types import (
+    AgentEvent,
+    AgentResult,
+    PromptContext,
+    ResponseSegment,
+    SessionSummary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,13 +25,12 @@ _RENDER_RE = re.compile(r"<!--render-->(.*?)<!--/render-->", re.DOTALL)
 
 class ClaudeCodeAgent:
     supports_resume = True
-    supports_fork = True
 
     def __init__(self, config: ClaudeCodeConfig):
         self.config = config
         self._sem = asyncio.Semaphore(config.max_concurrent)
-        # Track live subprocesses so we can kill them on shutdown
-        self._live_procs: set[asyncio.subprocess.Process] = set()
+        # session_key -> live subprocess (for interrupt / shutdown)
+        self._procs: dict[str, asyncio.subprocess.Process] = {}
 
     # ── Agent protocol: list_sessions ─────────────────────────────
 
@@ -34,10 +40,6 @@ class ClaudeCodeAgent:
         limit: int = 10,
         only_ids: set[str] | None = None,
     ) -> list[SessionSummary]:
-        """List recent CC sessions by reading JSONL files from disk.
-
-        If `only_ids` is given, filter to sessions whose id is in the set.
-        """
         cc_proj_dir = self._get_cc_project_dir(work_dir)
         if not cc_proj_dir or not cc_proj_dir.is_dir():
             return []
@@ -68,21 +70,15 @@ class ClaudeCodeAgent:
 
     @staticmethod
     def _get_cc_project_dir(work_dir: Path) -> Path | None:
-        """Map a workspace dir to CC's project history directory.
-
-        CC encodes project paths by replacing / and _ with -.
-        E.g. /home/saer/workspace/private_123 -> -home-saer-workspace-private-123
-        """
+        """Map a workspace dir to CC's project history directory."""
         projects_dir = Path.home() / ".claude" / "projects"
         if not projects_dir.is_dir():
             return None
-        # Build the expected encoded name
         raw = str(work_dir.resolve())
         encoded = raw.replace("/", "-").replace("_", "-").lstrip("-")
         cc_dir = projects_dir / f"-{encoded}"
         if cc_dir.is_dir():
             return cc_dir
-        # Fallback: scan for a matching directory (in case encoding changes)
         suffix = work_dir.name.replace("_", "-")
         for d in projects_dir.iterdir():
             if d.is_dir() and d.name.endswith(suffix):
@@ -91,7 +87,6 @@ class ClaudeCodeAgent:
 
     @staticmethod
     def _extract_last_user_message(jsonl_path: Path) -> str:
-        """Extract the last user message from a session JSONL file."""
         last_msg = ""
         try:
             with open(jsonl_path) as f:
@@ -104,7 +99,6 @@ class ClaudeCodeAgent:
                         continue
                     content = entry.get("message", {}).get("content", "")
                     if isinstance(content, list):
-                        # multimodal: extract text parts
                         text_parts = [
                             p.get("text", "")
                             for p in content
@@ -115,12 +109,11 @@ class ClaudeCodeAgent:
                         last_msg = content.strip()
         except OSError:
             pass
-        # Truncate for display
         if len(last_msg) > 50:
             last_msg = last_msg[:50] + "..."
         return last_msg
 
-    # ── Agent protocol: run ─────────────────────────────────────
+    # ── Agent protocol: run (streaming) ─────────────────────────
 
     async def run(
         self,
@@ -128,8 +121,8 @@ class ClaudeCodeAgent:
         work_dir: Path,
         session_id: str | None = None,
         is_admin: bool = False,
-        fork_session: bool = False,
-    ) -> AgentResult:
+        session_key: str | None = None,
+    ) -> AsyncIterator[AgentEvent]:
         cfg = self.config
         cmd: list[str] = [
             "claude",
@@ -144,8 +137,6 @@ class ClaudeCodeAgent:
 
         if session_id:
             cmd += ["--resume", session_id]
-            if fork_session:
-                cmd += ["--fork-session"]
 
         if is_admin:
             cmd += ["--dangerously-skip-permissions"]
@@ -183,44 +174,226 @@ class ClaudeCodeAgent:
                     stderr=asyncio.subprocess.PIPE,
                     cwd=str(work_dir),
                 )
-                self._live_procs.add(proc)
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(input=prompt.encode()),
-                    timeout=cfg.timeout,
+            except Exception as e:
+                logger.exception("Failed to spawn agent")
+                yield AgentEvent(
+                    kind="error",
+                    text=f"[Agent spawn error: {e}]",
+                    result=AgentResult(session_id=session_id),
                 )
-            except asyncio.TimeoutError:
-                await self._kill(proc)
-                logger.error("Agent timed out after %ds", cfg.timeout)
-                return AgentResult(
-                    text="[Agent timed out]", session_id=session_id
-                )
+                return
+
+            if session_key:
+                self._procs[session_key] = proc
+
+            # Feed prompt and close stdin so CC knows input is done.
+            assert proc.stdin is not None
+            try:
+                proc.stdin.write(prompt.encode())
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+            # Drain stderr concurrently (logged at end).
+            stderr_task = asyncio.create_task(self._drain_stderr(proc))
+
+            try:
+                async for ev in self._stream_events(proc, session_id):
+                    yield ev
             except asyncio.CancelledError:
-                # Shutdown in progress — kill the subprocess and re-raise
+                # Caller cancelled (shutdown / supersession). Kill and re-raise.
                 await self._kill(proc)
                 raise
-            except Exception as e:
-                logger.exception("Agent process error")
-                return AgentResult(
-                    text=f"[Agent error: {e}]", session_id=session_id
-                )
             finally:
-                if proc is not None:
-                    self._live_procs.discard(proc)
+                # Ensure subprocess is gone before releasing the semaphore.
+                await self._kill(proc, graceful=False)
+                try:
+                    await asyncio.wait_for(stderr_task, timeout=2)
+                except asyncio.TimeoutError:
+                    stderr_task.cancel()
+                if session_key and self._procs.get(session_key) is proc:
+                    self._procs.pop(session_key, None)
 
-        if stderr:
-            err = stderr.decode(errors="replace").strip()
-            if err:
-                # Stderr is rare and usually carries real errors (budget
-                # exceeded, API auth, etc.). Log at WARN so it doesn't get
-                # swallowed like before.
-                logger.warning("Agent stderr: %s", err[:1000])
+    async def _stream_events(
+        self,
+        proc: asyncio.subprocess.Process,
+        fallback_sid: str | None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Read CC's stream-json stdout line by line and yield AgentEvents.
 
-        return self._parse_output(stdout.decode(), session_id)
+        Emits:
+          - AgentEvent(kind="text", text=...)   per assistant text chunk
+          - AgentEvent(kind="result", result=...) on final result event (success)
+          - AgentEvent(kind="error", text=..., result=...) on error / truncation
+        """
+        assert proc.stdout is not None
+
+        r = AgentResult(session_id=fallback_sid)
+        saw_result = False
+        result_text = ""
+        result_is_error = False
+        result_error_subtype = ""
+        last_assistant_text = ""
+        any_text_sent = False
+
+        while True:
+            try:
+                line = await proc.stdout.readline()
+            except asyncio.LimitOverrunError:
+                # A single JSON line exceeded the default 64KB limit. Read in
+                # chunks until newline.
+                buf = bytearray()
+                while True:
+                    try:
+                        buf += await proc.stdout.read(65536)
+                    except Exception:
+                        break
+                    if b"\n" in buf:
+                        idx = buf.index(b"\n")
+                        line = bytes(buf[: idx + 1])
+                        break
+                    if not buf:
+                        line = b""
+                        break
+            if not line:
+                break
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            evt = data.get("type")
+
+            if evt == "system" and data.get("subtype") == "init":
+                r.session_id = data.get("session_id", r.session_id)
+                r.model = data.get("model", "")
+
+            elif evt == "system" and data.get("subtype") == "api_retry":
+                logger.warning(
+                    "API retry #%s: %s (delay %.0fms)",
+                    data.get("attempt"),
+                    data.get("error"),
+                    data.get("retry_delay_ms", 0),
+                )
+
+            elif evt == "assistant":
+                msg = data.get("message") or {}
+                content = msg.get("content") or []
+                if isinstance(content, list):
+                    text_parts = [
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    joined = "".join(t for t in text_parts if t).strip()
+                    if joined:
+                        last_assistant_text = joined
+                        any_text_sent = True
+                        yield AgentEvent(kind="text", text=joined)
+
+            elif evt == "result":
+                saw_result = True
+                result_text = data.get("result", "") or ""
+                result_is_error = bool(data.get("is_error"))
+                result_error_subtype = data.get("subtype", "") or ""
+                r.cost_usd = data.get("total_cost_usd", 0.0)
+                r.num_turns = data.get("num_turns", 0)
+                r.duration_ms = data.get("duration_ms", 0)
+
+                usage = data.get("usage", {})
+                r.input_tokens = usage.get("input_tokens", 0)
+                r.output_tokens = usage.get("output_tokens", 0)
+                r.cache_read_tokens = usage.get("cache_read_input_tokens", 0)
+                r.cache_creation_tokens = usage.get(
+                    "cache_creation_input_tokens", 0
+                )
+                for model_info in data.get("modelUsage", {}).values():
+                    r.context_window = model_info.get("contextWindow", 0)
+                    r.model = r.model or model_info.get("model", "")
+                    break
+                # result event is terminal
+                break
+
+        # ── Final disposition ──────────────────────────────────
+        if not saw_result:
+            # Subprocess exited without emitting result (killed, crashed,
+            # interrupted). Assistant text (if any) was already streamed.
+            logger.warning(
+                "Agent stream ended without 'result' event (sid=%s, "
+                "text_sent=%s)",
+                r.session_id,
+                any_text_sent,
+            )
+            yield AgentEvent(kind="error", text="", result=r)
+            return
+
+        if result_is_error:
+            logger.warning(
+                "Agent result is_error=True subtype=%s (sid=%s, result_text_len=%d, "
+                "last_assistant_len=%d)",
+                result_error_subtype,
+                r.session_id,
+                len(result_text),
+                len(last_assistant_text),
+            )
+            # If nothing was streamed yet, try to surface a message.
+            if not any_text_sent:
+                fallback = result_text or "[Agent error]"
+                yield AgentEvent(kind="text", text=fallback)
+            yield AgentEvent(kind="result", result=r)
+            return
+
+        # Clean exit. The result.result field mirrors the last assistant
+        # text, which we already streamed — do not resend.
+        if not any_text_sent:
+            # Unusual: clean result with no preceding assistant events. Could
+            # happen with a very short run. Fall back to result_text.
+            if result_text:
+                yield AgentEvent(kind="text", text=result_text)
+            else:
+                logger.warning(
+                    "Agent emitted no text at all (sid=%s)", r.session_id
+                )
+                yield AgentEvent(
+                    kind="text", text="[Agent returned empty response]"
+                )
+        yield AgentEvent(kind="result", result=r)
 
     @staticmethod
-    async def _kill(proc: asyncio.subprocess.Process | None) -> None:
+    async def _drain_stderr(proc: asyncio.subprocess.Process) -> None:
+        """Read all stderr, log at WARN if non-empty."""
+        if proc.stderr is None:
+            return
+        try:
+            data = await proc.stderr.read()
+        except Exception:
+            return
+        if data:
+            err = data.decode(errors="replace").strip()
+            if err:
+                logger.warning("Agent stderr: %s", err[:1000])
+
+    async def _kill(
+        self,
+        proc: asyncio.subprocess.Process | None,
+        graceful: bool = True,
+    ) -> None:
         if proc is None or proc.returncode is not None:
             return
+        if graceful:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                return
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3)
+                return
+            except asyncio.TimeoutError:
+                logger.warning("Agent did not exit 3s after SIGTERM; killing")
         try:
             proc.kill()
         except ProcessLookupError:
@@ -230,23 +403,28 @@ class ClaudeCodeAgent:
         except asyncio.TimeoutError:
             logger.warning("Agent subprocess did not exit 5s after SIGKILL")
 
-    async def shutdown(self, grace: float = 3.0) -> None:
-        """Ask running agent subprocesses to exit. Called on service shutdown.
+    # ── interrupt ───────────────────────────────────────────────
 
-        Waits up to `grace` seconds for natural exit, then SIGKILLs anything
-        still running.
-        """
-        procs = list(self._live_procs)
+    async def interrupt(self, session_key: str) -> bool:
+        """Kill the subprocess running for this session, if any."""
+        proc = self._procs.get(session_key)
+        if proc is None or proc.returncode is not None:
+            return False
+        logger.info("Interrupting agent for session %s (pid=%d)", session_key, proc.pid)
+        await self._kill(proc, graceful=True)
+        return True
+
+    async def shutdown(self, grace: float = 3.0) -> None:
+        """Called on service shutdown: SIGTERM all live subprocesses, then SIGKILL."""
+        procs = [p for p in self._procs.values() if p.returncode is None]
         if not procs:
             return
         logger.info("Shutdown: %d agent subprocess(es) still running", len(procs))
-        # Try SIGTERM first so CC can flush output / write history
         for p in procs:
-            if p.returncode is None:
-                try:
-                    p.terminate()
-                except ProcessLookupError:
-                    pass
+            try:
+                p.terminate()
+            except ProcessLookupError:
+                pass
         try:
             await asyncio.wait_for(
                 asyncio.gather(
@@ -266,37 +444,14 @@ class ClaudeCodeAgent:
     # ── Agent protocol: prepare_prompt ──────────────────────────
 
     def prepare_prompt(self, user_prompt: str, context: PromptContext) -> str:
-        """Assemble the final prompt using Claude Code's bracketed note format."""
+        """Assemble the final prompt using CC-friendly bracketed notes."""
         parts: list[str] = []
-
-        if context.pending_results:
-            ctx_parts = []
-            for i, res_text in enumerate(context.pending_results, 1):
-                truncated = res_text[:2000]
-                if len(res_text) > 2000:
-                    truncated += "\n... (truncated)"
-                ctx_parts.append(f"--- Task {i} ---\n{truncated}")
-            joined = "\n\n".join(ctx_parts)
-            parts.append(
-                "[Previously forked tasks completed and were sent to the user. "
-                "Summary below for context. Do not resend.]\n"
-                f"{joined}\n"
-                "[End of forked task results]"
-            )
 
         if context.group_context:
             parts.append(
                 "[Group chat context (messages since last @bot)]\n"
                 f"{context.group_context}\n"
                 "[End of context]"
-            )
-
-        if context.is_fork:
-            parts.append(
-                "[SYSTEM NOTE: A previous long-running task is still executing "
-                "in a separate process. DO NOT continue, restart, or reference "
-                "that task unless the user explicitly asks. Focus ONLY on the "
-                "new message below.]"
             )
 
         if context.is_replay:
@@ -322,7 +477,12 @@ class ClaudeCodeAgent:
     # ── Agent protocol: parse_response ──────────────────────────
 
     def parse_response(self, text: str) -> list[ResponseSegment]:
-        """Parse CC output, splitting on <!--SPLIT--> and extracting <!--render--> blocks."""
+        """Parse an assistant text chunk into ResponseSegments.
+
+        Splits on <!--SPLIT--> and extracts <!--render--> blocks.
+        Assumes markers are balanced within a single chunk (they are, since
+        a chunk is one assistant LLM turn).
+        """
         if not text:
             return []
 
@@ -344,129 +504,3 @@ class ClaudeCodeAgent:
                 is_render = not is_render
 
         return segments or [ResponseSegment("text", text)]
-
-    # ── stream-json parsing ─────────────────────────────────────
-
-    @staticmethod
-    def _parse_output(raw: str, fallback_sid: str | None) -> AgentResult:
-        r = AgentResult(session_id=fallback_sid)
-        saw_result = False
-        result_text = ""
-        result_is_error = False
-        result_error_subtype = ""
-        last_assistant_text = ""
-
-        for line in raw.strip().splitlines():
-            if not line.strip():
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            evt = data.get("type")
-
-            if evt == "system" and data.get("subtype") == "init":
-                r.session_id = data.get("session_id", r.session_id)
-                r.model = data.get("model", "")
-
-            elif evt == "system" and data.get("subtype") == "api_retry":
-                logger.warning(
-                    "API retry #%s: %s (delay %.0fms)",
-                    data.get("attempt"),
-                    data.get("error"),
-                    data.get("retry_delay_ms", 0),
-                )
-
-            elif evt == "assistant":
-                # Capture the most recent assistant text message so we can
-                # still deliver something if `result` ends up empty (e.g. CC
-                # aborts on budget with is_error=True).
-                msg = data.get("message") or {}
-                content = msg.get("content") or []
-                if isinstance(content, list):
-                    text_parts = [
-                        b.get("text", "")
-                        for b in content
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    ]
-                    joined = "".join(t for t in text_parts if t).strip()
-                    if joined:
-                        last_assistant_text = joined
-
-            elif evt == "result":
-                saw_result = True
-                result_text = data.get("result", "") or ""
-                result_is_error = bool(data.get("is_error"))
-                result_error_subtype = data.get("subtype", "") or ""
-                r.cost_usd = data.get("total_cost_usd", 0.0)
-                r.num_turns = data.get("num_turns", 0)
-                r.duration_ms = data.get("duration_ms", 0)
-
-                usage = data.get("usage", {})
-                r.input_tokens = usage.get("input_tokens", 0)
-                r.output_tokens = usage.get("output_tokens", 0)
-                r.cache_read_tokens = usage.get(
-                    "cache_read_input_tokens", 0
-                )
-                r.cache_creation_tokens = usage.get(
-                    "cache_creation_input_tokens", 0
-                )
-
-                for model_info in data.get("modelUsage", {}).values():
-                    r.context_window = model_info.get("contextWindow", 0)
-                    r.model = r.model or model_info.get("model", "")
-                    break
-
-        if not saw_result:
-            # No final `result` event — subprocess was killed or crashed before
-            # producing its reply. Return empty text so the gateway stays silent
-            # rather than posting a confusing "[Agent returned empty response]"
-            # placeholder. The message will be replayed on next startup if the
-            # gateway is shutting down.
-            logger.warning(
-                "Agent output truncated: no 'result' event (sid=%s, %d bytes of stdout). "
-                "Subprocess likely killed mid-run.",
-                r.session_id,
-                len(raw),
-            )
-            if last_assistant_text:
-                # At least surface what the agent had already typed.
-                r.text = last_assistant_text
-            return r
-
-        if result_is_error:
-            # CC aborted (budget, API error, ...). The `result` field is
-            # usually empty in this case, but the agent may have already
-            # produced a real reply in an earlier `assistant` event. Surface
-            # that rather than dropping it on the floor.
-            logger.warning(
-                "Agent result is_error=True subtype=%s (sid=%s, result_text_len=%d, "
-                "last_assistant_len=%d)",
-                result_error_subtype,
-                r.session_id,
-                len(result_text),
-                len(last_assistant_text),
-            )
-            if result_text:
-                r.text = f"[Agent error] {result_text}"
-            elif last_assistant_text:
-                r.text = last_assistant_text
-            else:
-                r.text = "[Agent error]"
-            return r
-
-        if result_text:
-            r.text = result_text
-        elif last_assistant_text:
-            # Unusual: clean exit but empty `result`. Still surface the last
-            # assistant text if we have one.
-            logger.warning(
-                "Agent result text empty but assistant events present (sid=%s)",
-                r.session_id,
-            )
-            r.text = last_assistant_text
-        else:
-            logger.warning("Agent emitted empty result text (sid=%s)", r.session_id)
-            r.text = "[Agent returned empty response]"
-        return r

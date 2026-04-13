@@ -34,19 +34,16 @@ class Gateway:
         # message queue per debounce key (session_key:user_id)
         self._queues: dict[str, list[Message]] = {}
         self._timers: dict[str, asyncio.Task] = {}
-        # Messages popped from _queues for processing but not yet responded to.
-        # Tracked here so shutdown can persist them for replay.
+        # Messages popped from _queues for processing but not yet fully
+        # responded to. Tracked so shutdown can persist them for replay.
         self._in_flight: dict[str, list[Message]] = {}
 
         # Active processing tasks, so shutdown can cancel them
         self._processing_tasks: set[asyncio.Task] = set()
 
-        # tracks running agent per session: session_key -> monotonic start time
+        # session_key -> monotonic start time of the current run
         self._busy_since: dict[str, float] = {}
         self._stall_timeout = config.gateway.stall_timeout
-
-        # results from tasks superseded by a fork
-        self._pending_results: dict[str, list[str]] = {}
 
         # Set once on_shutdown fires; used to skip new work during teardown
         self._shutting_down = False
@@ -59,7 +56,11 @@ class Gateway:
             platform, self.session_mgr, self.config.gateway.max_message_length
         )
         self._commands = CommandHandler(
-            platform, self.session_mgr, self.security, self._agent
+            platform,
+            self.session_mgr,
+            self.security,
+            self._agent,
+            on_stop=self._handle_stop,
         )
 
     def set_agent(self, agent: Agent):
@@ -70,11 +71,6 @@ class Gateway:
     # ── lifecycle ───────────────────────────────────────────────
 
     def load_inbox_and_resume(self) -> None:
-        """Load any persisted messages from a previous run and re-enqueue them.
-
-        Called once during startup, before the event loop starts accepting
-        new traffic.
-        """
         pending = self.session_mgr.load_inbox()
         if not pending:
             return
@@ -83,7 +79,6 @@ class Gateway:
             self._replay_dkeys.add(dkey)
 
     async def on_startup(self) -> None:
-        """Kick off debounce timers for any replayed messages."""
         for dkey in list(self._queues):
             if dkey not in self._timers:
                 self._timers[dkey] = asyncio.create_task(
@@ -91,36 +86,29 @@ class Gateway:
                 )
 
     async def on_shutdown(self, grace: float = 3.0) -> None:
-        """Called by aiohttp on_shutdown: cancel work, persist inbox."""
         if self._shutting_down:
             return
         self._shutting_down = True
         logger.info("Gateway shutdown starting")
 
-        # Cancel debounce timers — their messages remain in _queues.
         for t in list(self._timers.values()):
             t.cancel()
         self._timers.clear()
 
-        # Cancel in-flight processing tasks — _in_flight entries remain.
         for t in list(self._processing_tasks):
             t.cancel()
 
-        # Ask the agent to stop its subprocesses.
         if self._agent is not None and hasattr(self._agent, "shutdown"):
             try:
                 await self._agent.shutdown(grace=grace)
             except Exception:
                 logger.exception("Agent shutdown error")
 
-        # Wait briefly for processing tasks to unwind (so any successful
-        # responses already sent don't get replayed).
         if self._processing_tasks:
             await asyncio.gather(
                 *self._processing_tasks, return_exceptions=True
             )
 
-        # Snapshot remaining queue + in-flight messages for replay.
         combined: dict[str, list[Message]] = {}
         for dkey, msgs in self._in_flight.items():
             if msgs:
@@ -135,8 +123,8 @@ class Gateway:
 
     async def on_message(self, msg: Message):
         if self._shutting_down:
-            # Drop cleanly; the platform may buffer/retry.
             return
+
         # Security gate
         if msg.chat_type == "private":
             if not self.security.check_private(msg.sender_id):
@@ -151,7 +139,6 @@ class Gateway:
 
         msg.is_admin = self.security.is_admin(msg.sender_id)
 
-        # Rate limit (admin exempt)
         if not msg.is_admin and not self.rate_limiter.check(msg.sender_id):
             logger.info("Rate-limited user %s", msg.sender_id)
             return
@@ -160,10 +147,12 @@ class Gateway:
         if msg.text.startswith("/"):
             cmd_word = msg.text.split()[0].lower()
             if cmd_word in GATEWAY_COMMANDS:
-                await self._commands.handle(cmd_word, msg)
-                return
-            # /N resume pick — only intercept if there's a pending selection
-            if _RESUME_PICK_RE.match(cmd_word):
+                handled = await self._commands.handle(cmd_word, msg)
+                if handled:
+                    return
+                # /stop with payload returns False to signal "continue with
+                # the payload as a new message" — fall through.
+            elif _RESUME_PICK_RE.match(cmd_word):
                 session_key = SessionManager.make_key(
                     msg.chat_type, msg.chat_id
                 )
@@ -171,24 +160,46 @@ class Gateway:
                     await self._commands.handle(cmd_word, msg)
                     return
 
-        # Enqueue with debounce
+        await self._enqueue(msg)
+
+    async def _enqueue(self, msg: Message) -> None:
         session_key = SessionManager.make_key(msg.chat_type, msg.chat_id)
         dkey = f"{session_key}:{msg.sender_id}"
         self._queues.setdefault(dkey, []).append(msg)
-
-        if session_key in self._busy_since:
-            if old := self._timers.pop(dkey, None):
-                old.cancel()
-            self._timers[dkey] = asyncio.create_task(
-                self._debounce(dkey, short=True)
-            )
-            return
 
         if old := self._timers.pop(dkey, None):
             old.cancel()
         self._timers[dkey] = asyncio.create_task(
             self._debounce(dkey, short=True)
         )
+
+    # ── /stop callback from CommandHandler ─────────────────────
+
+    async def _handle_stop(self, msg: Message, payload: str) -> None:
+        """Called by /stop. Interrupts current run (if any) and optionally
+        queues the payload as a new message."""
+        session_key = SessionManager.make_key(msg.chat_type, msg.chat_id)
+
+        interrupted = False
+        if self._agent is not None:
+            interrupted = await self._agent.interrupt(session_key)
+
+        # Clear busy_since so the new message starts a fresh run immediately.
+        self._busy_since.pop(session_key, None)
+
+        payload = payload.strip()
+        if not payload:
+            note = "Stopped." if interrupted else "Nothing to stop."
+            reply_to = msg.message_id if msg.chat_type == "group" else None
+            await self._platform.send_text(
+                msg.chat_id, msg.chat_type, note, reply_to=reply_to
+            )
+            return
+
+        # Queue the payload as a new user message from the same sender.
+        from dataclasses import replace
+        new_msg = replace(msg, text=payload)
+        await self._enqueue(new_msg)
 
     # ── debounce & process ──────────────────────────────────────
 
@@ -197,8 +208,6 @@ class Gateway:
         try:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
-            # Cancelled during sleep — messages are still in _queues, they'll
-            # be persisted by shutdown.
             raise
         self._timers.pop(dkey, None)
         task = asyncio.current_task()
@@ -219,7 +228,6 @@ class Gateway:
         session_key = SessionManager.make_key(
             msgs[0].chat_type, msgs[0].chat_id
         )
-        fork = False
 
         if session_key in self._busy_since:
             elapsed = (
@@ -227,7 +235,8 @@ class Gateway:
                 - self._busy_since[session_key]
             )
             if elapsed < self._stall_timeout:
-                # Agent still within grace period — re-queue
+                # Give the current run a bit more time; keep the messages
+                # queued and re-fire the debounce.
                 self._queues.setdefault(dkey, []).extend(msgs)
                 if dkey not in self._timers:
                     self._timers[dkey] = asyncio.create_task(
@@ -235,41 +244,31 @@ class Gateway:
                     )
                 return
 
-            # Agent has been running too long
-            if self._agent.supports_fork:
-                fork = True
-                logger.info(
-                    "Session %s busy for %.0fs, forking",
-                    session_key,
-                    elapsed,
-                )
-            else:
-                # Agent can't fork — keep queuing until current run finishes
-                logger.info(
-                    "Session %s busy for %.0fs, agent doesn't support fork, re-queuing",
-                    session_key,
-                    elapsed,
-                )
-                self._queues.setdefault(dkey, []).extend(msgs)
-                if dkey not in self._timers:
-                    self._timers[dkey] = asyncio.create_task(
-                        self._debounce(dkey, short=True)
-                    )
-                return
+            # Run has been alive past stall_timeout — interrupt it so the
+            # new messages can take over the session.
+            logger.info(
+                "Session %s busy for %.0fs, interrupting current run",
+                session_key,
+                elapsed,
+            )
+            if self._agent is not None:
+                await self._agent.interrupt(session_key)
+            # Give the interrupted task a moment to unwind and release
+            # _busy_since (its finally block pops it).
+            for _ in range(20):
+                if session_key not in self._busy_since:
+                    break
+                await asyncio.sleep(0.1)
+            self._busy_since.pop(session_key, None)
 
-        if not fork:
-            self._busy_since[session_key] = asyncio.get_event_loop().time()
+        self._busy_since[session_key] = asyncio.get_event_loop().time()
 
-        # Mark these messages as in-flight so shutdown can snapshot them.
         self._in_flight.setdefault(dkey, []).extend(msgs)
         try:
-            await self._process(msgs, dkey=dkey, fork_session=fork)
+            await self._process(msgs, dkey=dkey)
         except asyncio.CancelledError:
-            # Shutdown or supersession cancelled us — leave in-flight entries
-            # in place so they get persisted to inbox.
             raise
         else:
-            # Processed successfully; drop these from in-flight.
             remaining = self._in_flight.get(dkey, [])
             for m in msgs:
                 try:
@@ -279,8 +278,7 @@ class Gateway:
             if not remaining:
                 self._in_flight.pop(dkey, None)
         finally:
-            if not fork:
-                self._busy_since.pop(session_key, None)
+            self._busy_since.pop(session_key, None)
 
         if dkey in self._queues and dkey not in self._timers:
             self._timers[dkey] = asyncio.create_task(
@@ -292,16 +290,12 @@ class Gateway:
         msgs: list[Message],
         *,
         dkey: str | None = None,
-        fork_session: bool = False,
     ):
         first = msgs[0]
         last = msgs[-1]
         session_key = SessionManager.make_key(first.chat_type, first.chat_id)
 
-        # ── gather context (gateway concern) ────────────────────
         user_prompt = self._build_prompt(msgs)
-
-        pending = self._pending_results.pop(session_key, None) or []
 
         group_context = ""
         if first.chat_type == "group":
@@ -317,11 +311,8 @@ class Gateway:
         if is_replay:
             self._replay_dkeys.discard(dkey)
 
-        # ── let agent assemble the final prompt ─────────────────
         context = PromptContext(
-            pending_results=pending,
             group_context=group_context,
-            is_fork=fork_session,
             image_paths=img_paths,
             is_replay=is_replay,
         )
@@ -330,57 +321,75 @@ class Gateway:
         if not prompt.strip():
             return
 
-        # ── run agent ───────────────────────────────────────────
         work_dir = self.session_mgr.get_work_dir(session_key)
         sid = self.session_mgr.get_agent_session_id(session_key)
 
-        result = await self._agent.run(
+        # Stream events from agent, sending each text chunk as it arrives.
+        first_text = True
+        reply_anchor = last.message_id
+        sender_id = last.sender_id
+        final_result = None
+
+        async for event in self._agent.run(
             prompt=prompt,
             work_dir=work_dir,
             session_id=sid,
             is_admin=first.is_admin,
-            fork_session=fork_session,
-        )
+            session_key=session_key,
+        ):
+            if event.kind == "text":
+                segments = self._agent.parse_response(event.text)
+                for seg in segments:
+                    if seg.type == "text":
+                        await self._response.send_segment(
+                            seg,
+                            last.chat_id,
+                            last.chat_type,
+                            reply_anchor if first_text else None,
+                            sender_id,
+                        )
+                        first_text = False
+                    else:
+                        await self._response.send_segment(
+                            seg, last.chat_id, last.chat_type, None, sender_id
+                        )
+                    await asyncio.sleep(0.2)
+            elif event.kind == "result":
+                final_result = event.result
+            elif event.kind == "error":
+                final_result = event.result
+                if event.text:
+                    segments = self._agent.parse_response(event.text)
+                    for seg in segments:
+                        await self._response.send_segment(
+                            seg,
+                            last.chat_id,
+                            last.chat_type,
+                            reply_anchor if first_text and seg.type == "text" else None,
+                            sender_id,
+                        )
+                        if seg.type == "text":
+                            first_text = False
 
-        # Update session ID
-        if result.session_id and result.session_id != sid:
-            self.session_mgr.set_agent_session_id(
-                session_key, result.session_id
+        # Persist session_id + stats from the final event.
+        if final_result is not None:
+            if (
+                final_result.session_id
+                and final_result.session_id != sid
+            ):
+                self.session_mgr.set_agent_session_id(
+                    session_key, final_result.session_id
+                )
+            self.session_mgr.update_stats(
+                session_key,
+                cost_usd=final_result.cost_usd,
+                input_tokens=final_result.input_tokens,
+                output_tokens=final_result.output_tokens,
+                cache_read=final_result.cache_read_tokens,
+                cache_creation=final_result.cache_creation_tokens,
+                context_window=final_result.context_window,
+                model=final_result.model,
             )
-
-        # If this was the OLD task and a fork has taken over, stash result
-        if not fork_session and result.text:
-            current_sid = self.session_mgr.get_agent_session_id(session_key)
-            if current_sid and current_sid != sid:
-                self._pending_results.setdefault(session_key, []).append(
-                    result.text
-                )
-                logger.info(
-                    "Session %s: stashed superseded result (%d chars)",
-                    session_key,
-                    len(result.text),
-                )
-
-        self.session_mgr.update_stats(
-            session_key,
-            cost_usd=result.cost_usd,
-            input_tokens=result.input_tokens,
-            output_tokens=result.output_tokens,
-            cache_read=result.cache_read_tokens,
-            cache_creation=result.cache_creation_tokens,
-            context_window=result.context_window,
-            model=result.model,
-        )
-
-        # ── let agent parse response, then send ────────────────
-        segments = self._agent.parse_response(result.text)
-        await self._response.send(
-            segments,
-            last.chat_id,
-            last.chat_type,
-            last.message_id,
-            last.sender_id,
-        )
 
     # ── prompt building (gateway concern: merge debounced messages) ──
 
@@ -398,7 +407,7 @@ class Gateway:
                 parts.append(m.text)
         return "\n\n".join(parts)
 
-    # ── group context (gateway concern: fetch history, find cutoff) ──
+    # ── group context ──────────────────────────────────────────
 
     async def _fetch_group_context(self, chat_id: int) -> str:
         history = await self._platform.fetch_history(chat_id, limit=1000)

@@ -1,9 +1,10 @@
-"""Gateway commands (/new, /session, /resume, /help)."""
+"""Gateway commands (/new, /session, /resume, /stop, /help)."""
 from __future__ import annotations
 
 import logging
 import re
 import time
+from typing import Awaitable, Callable
 
 from .agents.base import Agent
 from .platforms.base import ChatPlatform
@@ -13,7 +14,10 @@ from .types import Message
 
 logger = logging.getLogger(__name__)
 
-GATEWAY_COMMANDS = {"/new", "/session", "/resume", "/help"}
+GATEWAY_COMMANDS = {"/new", "/session", "/resume", "/stop", "/help"}
+
+# Callback signature: (original message, payload after /stop) -> None
+StopHandler = Callable[[Message, str], Awaitable[None]]
 
 # Matches /1, /2, ... /99
 _RESUME_PICK_RE = re.compile(r"^/(\d{1,2})$")
@@ -29,17 +33,19 @@ class CommandHandler:
         session_mgr: SessionManager,
         security: SecurityChecker,
         agent: Agent | None = None,
+        on_stop: StopHandler | None = None,
     ):
         self.platform = platform
         self.session_mgr = session_mgr
         self.security = security
         self.agent = agent
+        self._on_stop = on_stop
 
         # session_key -> (timestamp, [session_id, ...])
         self._pending_resume: dict[str, tuple[float, list[str]]] = {}
 
     async def handle(self, cmd: str, msg: Message) -> bool:
-        """Handle a gateway command. Returns True if handled."""
+        """Handle a gateway command. Returns True if fully handled."""
         session_key = SessionManager.make_key(msg.chat_type, msg.chat_id)
 
         # Check /N pick first (not in GATEWAY_COMMANDS but routed here)
@@ -51,6 +57,9 @@ class CommandHandler:
 
         if cmd not in GATEWAY_COMMANDS:
             return False
+
+        if cmd == "/stop":
+            return await self._handle_stop(msg)
 
         if cmd == "/new":
             if not self.security.is_admin(msg.sender_id):
@@ -70,6 +79,8 @@ class CommandHandler:
                 "/new — Reset session (admin)\n"
                 "/session — Session info\n"
                 "/resume — List recent sessions to switch to\n"
+                "/stop — Interrupt current run. `/stop <msg>` interrupts then "
+                "sends msg as the next prompt (admin)\n"
                 "/help — Show help\n"
                 "Other /commands are passed through to the agent"
             )
@@ -80,6 +91,37 @@ class CommandHandler:
         await self.platform.send_text(
             msg.chat_id, msg.chat_type, text, reply_to=reply_to
         )
+        return True
+
+    async def _handle_stop(self, msg: Message) -> bool:
+        if not self.security.is_admin(msg.sender_id):
+            reply_to = msg.message_id if msg.chat_type == "group" else None
+            await self.platform.send_text(
+                msg.chat_id,
+                msg.chat_type,
+                "Permission denied: admin only.",
+                reply_to=reply_to,
+            )
+            return True
+
+        # Everything after "/stop" (including whitespace-stripped remainder)
+        # becomes the follow-up prompt. Empty means "just stop".
+        raw = msg.text
+        payload = raw[len("/stop"):] if raw.lower().startswith("/stop") else ""
+        # Drop exactly one leading whitespace character (to allow "/stop foo"
+        # → "foo") but preserve any intentional leading space beyond that.
+        if payload.startswith(" ") or payload.startswith("\t") or payload.startswith("\n"):
+            payload = payload[1:]
+        payload = payload.strip()
+
+        if self._on_stop is None:
+            reply_to = msg.message_id if msg.chat_type == "group" else None
+            await self.platform.send_text(
+                msg.chat_id, msg.chat_type, "/stop not wired up.", reply_to=reply_to
+            )
+            return True
+
+        await self._on_stop(msg, payload)
         return True
 
     def has_pending_resume(self, session_key: str) -> bool:

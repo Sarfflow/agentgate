@@ -70,9 +70,7 @@ class AgentResult:
 class PromptContext:
     """Context the gateway passes to the agent for prompt assembly."""
 
-    pending_results: list[str] = field(default_factory=list)
     group_context: str = ""
-    is_fork: bool = False
     image_paths: list[str] = field(default_factory=list)
     is_replay: bool = False
     """True if this message was saved across a gateway restart and is being re-processed."""
@@ -84,6 +82,27 @@ class ResponseSegment:
 
     type: str  # "text" or "render" (markdown to PNG)
     content: str
+
+
+@dataclass
+class AgentEvent:
+    """One event yielded from Agent.run() as the agent streams.
+
+    - kind="text": the agent produced a new assistant text chunk. `text`
+      holds the raw text; the gateway runs it through parse_response and
+      delivers the resulting segments immediately.
+    - kind="result": final event. `result` holds the full AgentResult
+      (session id, cost, tokens, context window, etc.) so the gateway
+      can update stats. No user-visible text here — any final text was
+      already delivered via preceding "text" events.
+    - kind="error": agent failed or was interrupted. `text` is a short
+      diagnostic suitable for delivery to the user (may be empty, in
+      which case the gateway can stay silent).
+    """
+
+    kind: str
+    text: str = ""
+    result: "AgentResult | None" = None
 
 
 @dataclass

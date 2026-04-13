@@ -31,27 +31,39 @@ class ResponseSender:
         reply_msg_id: int,
         sender_id: int,
     ):
+        """Send a batch of segments; first text uses reply_msg_id as reply anchor."""
         if not segments:
             return
 
         first_text = True
         for i, seg in enumerate(segments):
-            if seg.type == "render":
-                await self._send_rendered_image(
-                    seg.content, chat_id, chat_type
-                )
-            else:
-                await self._send_text(
-                    seg.content,
-                    chat_id,
-                    chat_type,
-                    reply_msg_id if first_text else None,
-                    sender_id,
-                )
+            await self.send_segment(
+                seg,
+                chat_id,
+                chat_type,
+                reply_msg_id if (first_text and seg.type == "text") else None,
+                sender_id,
+            )
+            if seg.type == "text":
                 first_text = False
-
             if i < len(segments) - 1:
                 await asyncio.sleep(0.5)
+
+    async def send_segment(
+        self,
+        seg: ResponseSegment,
+        chat_id: int,
+        chat_type: str,
+        reply_msg_id: int | None,
+        sender_id: int,
+    ):
+        """Send a single segment. `reply_msg_id` only used for text segments."""
+        if seg.type == "render":
+            await self._send_rendered_image(seg.content, chat_id, chat_type)
+        else:
+            await self._send_text(
+                seg.content, chat_id, chat_type, reply_msg_id, sender_id
+            )
 
     async def _send_text(
         self,
