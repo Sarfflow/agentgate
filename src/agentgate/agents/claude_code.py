@@ -208,7 +208,12 @@ class ClaudeCodeAgent:
                     self._live_procs.discard(proc)
 
         if stderr:
-            logger.debug("Agent stderr: %s", stderr.decode()[:500])
+            err = stderr.decode(errors="replace").strip()
+            if err:
+                # Stderr is rare and usually carries real errors (budget
+                # exceeded, API auth, etc.). Log at WARN so it doesn't get
+                # swallowed like before.
+                logger.warning("Agent stderr: %s", err[:1000])
 
         return self._parse_output(stdout.decode(), session_id)
 
@@ -346,6 +351,10 @@ class ClaudeCodeAgent:
     def _parse_output(raw: str, fallback_sid: str | None) -> AgentResult:
         r = AgentResult(session_id=fallback_sid)
         saw_result = False
+        result_text = ""
+        result_is_error = False
+        result_error_subtype = ""
+        last_assistant_text = ""
 
         for line in raw.strip().splitlines():
             if not line.strip():
@@ -369,11 +378,27 @@ class ClaudeCodeAgent:
                     data.get("retry_delay_ms", 0),
                 )
 
+            elif evt == "assistant":
+                # Capture the most recent assistant text message so we can
+                # still deliver something if `result` ends up empty (e.g. CC
+                # aborts on budget with is_error=True).
+                msg = data.get("message") or {}
+                content = msg.get("content") or []
+                if isinstance(content, list):
+                    text_parts = [
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    joined = "".join(t for t in text_parts if t).strip()
+                    if joined:
+                        last_assistant_text = joined
+
             elif evt == "result":
                 saw_result = True
-                r.text = data.get("result", "")
-                if data.get("is_error"):
-                    r.text = f"[Agent error] {r.text}"
+                result_text = data.get("result", "") or ""
+                result_is_error = bool(data.get("is_error"))
+                result_error_subtype = data.get("subtype", "") or ""
                 r.cost_usd = data.get("total_cost_usd", 0.0)
                 r.num_turns = data.get("num_turns", 0)
                 r.duration_ms = data.get("duration_ms", 0)
@@ -405,9 +430,43 @@ class ClaudeCodeAgent:
                 r.session_id,
                 len(raw),
             )
+            if last_assistant_text:
+                # At least surface what the agent had already typed.
+                r.text = last_assistant_text
             return r
 
-        if not r.text:
+        if result_is_error:
+            # CC aborted (budget, API error, ...). The `result` field is
+            # usually empty in this case, but the agent may have already
+            # produced a real reply in an earlier `assistant` event. Surface
+            # that rather than dropping it on the floor.
+            logger.warning(
+                "Agent result is_error=True subtype=%s (sid=%s, result_text_len=%d, "
+                "last_assistant_len=%d)",
+                result_error_subtype,
+                r.session_id,
+                len(result_text),
+                len(last_assistant_text),
+            )
+            if result_text:
+                r.text = f"[Agent error] {result_text}"
+            elif last_assistant_text:
+                r.text = last_assistant_text
+            else:
+                r.text = "[Agent error]"
+            return r
+
+        if result_text:
+            r.text = result_text
+        elif last_assistant_text:
+            # Unusual: clean exit but empty `result`. Still surface the last
+            # assistant text if we have one.
+            logger.warning(
+                "Agent result text empty but assistant events present (sid=%s)",
+                r.session_id,
+            )
+            r.text = last_assistant_text
+        else:
             logger.warning("Agent emitted empty result text (sid=%s)", r.session_id)
             r.text = "[Agent returned empty response]"
         return r
