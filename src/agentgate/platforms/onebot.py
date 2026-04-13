@@ -34,6 +34,17 @@ class OneBotPlatform:
 
     def register(self, app: web.Application):
         app.router.add_get("/onebot/v11/ws", self._handle_ws)
+        # Without this, the reverse-WS handler never exits on shutdown and
+        # systemd ends up hitting TimeoutStopSec.
+        app.on_shutdown.append(self._on_shutdown)
+
+    async def _on_shutdown(self, _app: web.Application) -> None:
+        ws = self._ws
+        if ws is not None and not ws.closed:
+            try:
+                await ws.close(code=1001, message=b"server shutdown")
+            except Exception:
+                logger.exception("Error closing platform WS on shutdown")
 
     # ── WebSocket handler ───────────────────────────────────────
 

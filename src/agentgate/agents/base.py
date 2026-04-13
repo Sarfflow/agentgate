@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from ..types import AgentResult, PromptContext, ResponseSegment
+from ..types import AgentResult, PromptContext, ResponseSegment, SessionSummary
 
 
 @runtime_checkable
@@ -42,6 +42,22 @@ class Agent(Protocol):
         PromptContext; the agent decides how to present it.
         """
         ...
+
+    def list_sessions(
+        self,
+        work_dir: Path,
+        limit: int = 10,
+        only_ids: set[str] | None = None,
+    ) -> list[SessionSummary]:
+        """List recent sessions for a workspace, newest first.
+
+        If `only_ids` is provided, only sessions whose id is in the set are
+        returned (used to hide sessions created outside the gateway).
+
+        Returns an empty list if the agent doesn't support session listing
+        or has no history on disk.
+        """
+        return []
 
     def parse_response(self, text: str) -> list[ResponseSegment]:
         """Parse raw agent output into typed segments for sending.

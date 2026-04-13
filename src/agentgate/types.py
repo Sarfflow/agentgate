@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 
 @dataclass
@@ -17,6 +18,35 @@ class Message:
     reply_text: str | None = None
     is_bot_mentioned: bool = False
     is_admin: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "text": self.text,
+            "images": list(self.images),
+            "sender_id": self.sender_id,
+            "sender_name": self.sender_name,
+            "chat_id": self.chat_id,
+            "chat_type": self.chat_type,
+            "message_id": self.message_id,
+            "reply_text": self.reply_text,
+            "is_bot_mentioned": self.is_bot_mentioned,
+            "is_admin": self.is_admin,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Message":
+        return cls(
+            text=d.get("text", ""),
+            images=list(d.get("images", [])),
+            sender_id=int(d.get("sender_id", 0)),
+            sender_name=d.get("sender_name", ""),
+            chat_id=int(d.get("chat_id", 0)),
+            chat_type=d.get("chat_type", ""),
+            message_id=int(d.get("message_id", 0)),
+            reply_text=d.get("reply_text"),
+            is_bot_mentioned=bool(d.get("is_bot_mentioned", False)),
+            is_admin=bool(d.get("is_admin", False)),
+        )
 
 
 @dataclass
@@ -44,6 +74,8 @@ class PromptContext:
     group_context: str = ""
     is_fork: bool = False
     image_paths: list[str] = field(default_factory=list)
+    is_replay: bool = False
+    """True if this message was saved across a gateway restart and is being re-processed."""
 
 
 @dataclass
@@ -52,6 +84,15 @@ class ResponseSegment:
 
     type: str  # "text" or "render" (markdown to PNG)
     content: str
+
+
+@dataclass
+class SessionSummary:
+    """Summary of a past agent session, for /resume listing."""
+
+    session_id: str = ""
+    last_modified: datetime | None = None
+    last_user_message: str = ""
 
 
 @dataclass

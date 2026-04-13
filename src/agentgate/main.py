@@ -45,12 +45,30 @@ def main():
     app = web.Application()
     platform.register(app)
 
+    # Re-enqueue any messages persisted from a previous run
+    gateway.load_inbox_and_resume()
+
+    async def _on_startup(_app):
+        await gateway.on_startup()
+
+    async def _on_shutdown(_app):
+        await gateway.on_shutdown(grace=3.0)
+
+    app.on_startup.append(_on_startup)
+    app.on_shutdown.append(_on_shutdown)
+
     log.info(
         "agentgate starting — WS port %d, workspace %s",
         config.onebot.ws_port,
         gateway.session_mgr.work_dir,
     )
-    web.run_app(app, host="0.0.0.0", port=config.onebot.ws_port, print=None)
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=config.onebot.ws_port,
+        print=None,
+        shutdown_timeout=10.0,
+    )
 
 
 if __name__ == "__main__":

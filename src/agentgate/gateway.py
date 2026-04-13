@@ -8,7 +8,7 @@ from datetime import datetime
 import aiohttp
 
 from .agents.base import Agent
-from .commands import GATEWAY_COMMANDS, CommandHandler
+from .commands import GATEWAY_COMMANDS, CommandHandler, _RESUME_PICK_RE
 from .config import Config
 from .platforms.base import ChatPlatform
 from .response import ResponseSender
@@ -34,6 +34,12 @@ class Gateway:
         # message queue per debounce key (session_key:user_id)
         self._queues: dict[str, list[Message]] = {}
         self._timers: dict[str, asyncio.Task] = {}
+        # Messages popped from _queues for processing but not yet responded to.
+        # Tracked here so shutdown can persist them for replay.
+        self._in_flight: dict[str, list[Message]] = {}
+
+        # Active processing tasks, so shutdown can cancel them
+        self._processing_tasks: set[asyncio.Task] = set()
 
         # tracks running agent per session: session_key -> monotonic start time
         self._busy_since: dict[str, float] = {}
@@ -42,21 +48,95 @@ class Gateway:
         # results from tasks superseded by a fork
         self._pending_results: dict[str, list[str]] = {}
 
+        # Set once on_shutdown fires; used to skip new work during teardown
+        self._shutting_down = False
+        # Marks dkeys that are being replayed after a restart
+        self._replay_dkeys: set[str] = set()
+
     def set_platform(self, platform: ChatPlatform):
         self._platform = platform
         self._response = ResponseSender(
             platform, self.session_mgr, self.config.gateway.max_message_length
         )
         self._commands = CommandHandler(
-            platform, self.session_mgr, self.security
+            platform, self.session_mgr, self.security, self._agent
         )
 
     def set_agent(self, agent: Agent):
         self._agent = agent
+        if self._commands:
+            self._commands.agent = agent
+
+    # ── lifecycle ───────────────────────────────────────────────
+
+    def load_inbox_and_resume(self) -> None:
+        """Load any persisted messages from a previous run and re-enqueue them.
+
+        Called once during startup, before the event loop starts accepting
+        new traffic.
+        """
+        pending = self.session_mgr.load_inbox()
+        if not pending:
+            return
+        for dkey, msgs in pending.items():
+            self._queues.setdefault(dkey, []).extend(msgs)
+            self._replay_dkeys.add(dkey)
+
+    async def on_startup(self) -> None:
+        """Kick off debounce timers for any replayed messages."""
+        for dkey in list(self._queues):
+            if dkey not in self._timers:
+                self._timers[dkey] = asyncio.create_task(
+                    self._debounce(dkey, short=True)
+                )
+
+    async def on_shutdown(self, grace: float = 3.0) -> None:
+        """Called by aiohttp on_shutdown: cancel work, persist inbox."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        logger.info("Gateway shutdown starting")
+
+        # Cancel debounce timers — their messages remain in _queues.
+        for t in list(self._timers.values()):
+            t.cancel()
+        self._timers.clear()
+
+        # Cancel in-flight processing tasks — _in_flight entries remain.
+        for t in list(self._processing_tasks):
+            t.cancel()
+
+        # Ask the agent to stop its subprocesses.
+        if self._agent is not None and hasattr(self._agent, "shutdown"):
+            try:
+                await self._agent.shutdown(grace=grace)
+            except Exception:
+                logger.exception("Agent shutdown error")
+
+        # Wait briefly for processing tasks to unwind (so any successful
+        # responses already sent don't get replayed).
+        if self._processing_tasks:
+            await asyncio.gather(
+                *self._processing_tasks, return_exceptions=True
+            )
+
+        # Snapshot remaining queue + in-flight messages for replay.
+        combined: dict[str, list[Message]] = {}
+        for dkey, msgs in self._in_flight.items():
+            if msgs:
+                combined.setdefault(dkey, []).extend(msgs)
+        for dkey, msgs in self._queues.items():
+            if msgs:
+                combined.setdefault(dkey, []).extend(msgs)
+        self.session_mgr.save_inbox(combined)
+        logger.info("Gateway shutdown complete")
 
     # ── entry point (called by platform adapter) ────────────────
 
     async def on_message(self, msg: Message):
+        if self._shutting_down:
+            # Drop cleanly; the platform may buffer/retry.
+            return
         # Security gate
         if msg.chat_type == "private":
             if not self.security.check_private(msg.sender_id):
@@ -82,6 +162,14 @@ class Gateway:
             if cmd_word in GATEWAY_COMMANDS:
                 await self._commands.handle(cmd_word, msg)
                 return
+            # /N resume pick — only intercept if there's a pending selection
+            if _RESUME_PICK_RE.match(cmd_word):
+                session_key = SessionManager.make_key(
+                    msg.chat_type, msg.chat_id
+                )
+                if self._commands.has_pending_resume(session_key):
+                    await self._commands.handle(cmd_word, msg)
+                    return
 
         # Enqueue with debounce
         session_key = SessionManager.make_key(msg.chat_type, msg.chat_id)
@@ -106,9 +194,21 @@ class Gateway:
 
     async def _debounce(self, dkey: str, *, short: bool = False):
         delay = 3.0 if short else self.config.gateway.debounce_seconds
-        await asyncio.sleep(delay)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            # Cancelled during sleep — messages are still in _queues, they'll
+            # be persisted by shutdown.
+            raise
         self._timers.pop(dkey, None)
-        await self._flush_and_process(dkey)
+        task = asyncio.current_task()
+        if task is not None:
+            self._processing_tasks.add(task)
+        try:
+            await self._flush_and_process(dkey)
+        finally:
+            if task is not None:
+                self._processing_tasks.discard(task)
 
     async def _flush_and_process(self, dkey: str):
         msgs = self._queues.pop(dkey, [])
@@ -160,8 +260,24 @@ class Gateway:
         if not fork:
             self._busy_since[session_key] = asyncio.get_event_loop().time()
 
+        # Mark these messages as in-flight so shutdown can snapshot them.
+        self._in_flight.setdefault(dkey, []).extend(msgs)
         try:
-            await self._process(msgs, fork_session=fork)
+            await self._process(msgs, dkey=dkey, fork_session=fork)
+        except asyncio.CancelledError:
+            # Shutdown or supersession cancelled us — leave in-flight entries
+            # in place so they get persisted to inbox.
+            raise
+        else:
+            # Processed successfully; drop these from in-flight.
+            remaining = self._in_flight.get(dkey, [])
+            for m in msgs:
+                try:
+                    remaining.remove(m)
+                except ValueError:
+                    pass
+            if not remaining:
+                self._in_flight.pop(dkey, None)
         finally:
             if not fork:
                 self._busy_since.pop(session_key, None)
@@ -172,7 +288,11 @@ class Gateway:
             )
 
     async def _process(
-        self, msgs: list[Message], *, fork_session: bool = False
+        self,
+        msgs: list[Message],
+        *,
+        dkey: str | None = None,
+        fork_session: bool = False,
     ):
         first = msgs[0]
         last = msgs[-1]
@@ -193,12 +313,17 @@ class Gateway:
             if p := await self._download_image(url, session_key):
                 img_paths.append(p)
 
+        is_replay = dkey is not None and dkey in self._replay_dkeys
+        if is_replay:
+            self._replay_dkeys.discard(dkey)
+
         # ── let agent assemble the final prompt ─────────────────
         context = PromptContext(
             pending_results=pending,
             group_context=group_context,
             is_fork=fork_session,
             image_paths=img_paths,
+            is_replay=is_replay,
         )
         prompt = self._agent.prepare_prompt(user_prompt, context)
 

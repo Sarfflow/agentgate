@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
 from pathlib import Path
 
 from .config import Config
+from .types import Message
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +92,22 @@ class SessionManager:
     # ── persistence ─────────────────────────────────────────────
 
     def _load(self) -> dict:
+        data: dict = {}
         if self._file.exists():
             try:
-                return json.loads(self._file.read_text())
+                data = json.loads(self._file.read_text())
             except (json.JSONDecodeError, OSError):
-                return {}
-        return {}
+                data = {}
+        # Backfill known_sessions for entries predating that field: seed it
+        # with the current agent_session_id so /resume still shows something
+        # useful after this upgrade.
+        for entry in data.values():
+            if not isinstance(entry, dict):
+                continue
+            sid = entry.get("agent_session_id")
+            if sid and "known_sessions" not in entry:
+                entry["known_sessions"] = [sid]
+        return data
 
     def _save(self):
         self._file.write_text(
@@ -113,8 +125,20 @@ class SessionManager:
         return self._sessions.get(key, {}).get("agent_session_id")
 
     def set_agent_session_id(self, key: str, session_id: str):
-        self._sessions.setdefault(key, {})["agent_session_id"] = session_id
+        s = self._sessions.setdefault(key, {})
+        s["agent_session_id"] = session_id
+        known = s.setdefault("known_sessions", [])
+        if session_id and session_id not in known:
+            known.append(session_id)
         self._save()
+
+    def get_known_sessions(self, key: str) -> list[str]:
+        """Return session IDs the gateway has seen for this chat.
+
+        Used by /resume to filter out sessions created outside the gateway
+        (e.g. by cron jobs running claude -p in the same workspace).
+        """
+        return list(self._sessions.get(key, {}).get("known_sessions", []))
 
     def update_stats(
         self,
@@ -155,3 +179,65 @@ class SessionManager:
     def reset(self, key: str):
         self._sessions.pop(key, None)
         self._save()
+
+    # ── inbox persistence (survive restart) ─────────────────────
+
+    @property
+    def _inbox_file(self) -> Path:
+        return self.data_dir / "inbox.json"
+
+    def save_inbox(self, pending: dict[str, list[Message]]) -> None:
+        """Snapshot pending messages to disk. `pending` maps dkey -> [Message]."""
+        if not pending:
+            # Nothing pending — clean up any stale file
+            try:
+                self._inbox_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+
+        payload = {
+            "version": 1,
+            "dkeys": {
+                dkey: [m.to_dict() for m in msgs]
+                for dkey, msgs in pending.items()
+                if msgs
+            },
+        }
+        # Atomic write so a crash mid-write doesn't corrupt the file
+        with tempfile.NamedTemporaryFile(
+            "w", dir=str(self.data_dir), delete=False, prefix=".inbox.", suffix=".tmp"
+        ) as f:
+            json.dump(payload, f, ensure_ascii=False)
+            tmp_name = f.name
+        Path(tmp_name).replace(self._inbox_file)
+        logger.info(
+            "Saved inbox snapshot: %d dkeys, %d messages",
+            len(payload["dkeys"]),
+            sum(len(v) for v in payload["dkeys"].values()),
+        )
+
+    def load_inbox(self) -> dict[str, list[Message]]:
+        """Load and consume the inbox snapshot. The file is deleted after load."""
+        if not self._inbox_file.exists():
+            return {}
+        try:
+            data = json.loads(self._inbox_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            logger.exception("Failed to load inbox; ignoring")
+            self._inbox_file.unlink(missing_ok=True)
+            return {}
+
+        out: dict[str, list[Message]] = {}
+        for dkey, raws in data.get("dkeys", {}).items():
+            msgs = [Message.from_dict(r) for r in raws if isinstance(r, dict)]
+            if msgs:
+                out[dkey] = msgs
+        self._inbox_file.unlink(missing_ok=True)
+        if out:
+            logger.info(
+                "Loaded inbox snapshot: %d dkeys, %d messages",
+                len(out),
+                sum(len(v) for v in out.values()),
+            )
+        return out
