@@ -10,6 +10,7 @@ class Message:
 
     text: str = ""
     images: list[str] = field(default_factory=list)  # image URLs
+    files: list[dict] = field(default_factory=list)  # [{"name": ..., "url": ...}]
     sender_id: int = 0
     sender_name: str = ""
     chat_id: int = 0
@@ -23,6 +24,7 @@ class Message:
         return {
             "text": self.text,
             "images": list(self.images),
+            "files": list(self.files),
             "sender_id": self.sender_id,
             "sender_name": self.sender_name,
             "chat_id": self.chat_id,
@@ -38,6 +40,7 @@ class Message:
         return cls(
             text=d.get("text", ""),
             images=list(d.get("images", [])),
+            files=list(d.get("files", [])),
             sender_id=int(d.get("sender_id", 0)),
             sender_name=d.get("sender_name", ""),
             chat_id=int(d.get("chat_id", 0)),
@@ -72,6 +75,7 @@ class PromptContext:
 
     group_context: str = ""
     image_paths: list[str] = field(default_factory=list)
+    file_paths: list[str] = field(default_factory=list)
     is_replay: bool = False
     """True if this message was saved across a gateway restart and is being re-processed."""
 

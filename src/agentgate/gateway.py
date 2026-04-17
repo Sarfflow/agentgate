@@ -49,6 +49,8 @@ class Gateway:
         self._shutting_down = False
         # Marks dkeys that are being replayed after a restart
         self._replay_dkeys: set[str] = set()
+        # Emergency lockdown: when True, ignore all messages except admin /unlock
+        self._locked = False
 
     def set_platform(self, platform: ChatPlatform):
         self._platform = platform
@@ -61,6 +63,7 @@ class Gateway:
             self.security,
             self._agent,
             on_stop=self._handle_stop,
+            on_kill=self._handle_kill,
         )
 
     def set_agent(self, agent: Agent):
@@ -123,6 +126,24 @@ class Gateway:
 
     async def on_message(self, msg: Message):
         if self._shutting_down:
+            return
+
+        # Emergency lockdown check
+        if self._locked:
+            is_admin = self.security.is_admin(msg.sender_id)
+            if is_admin and msg.text.strip().lower() == "/unlock":
+                self._locked = False
+                logger.info("Gateway unlocked by admin %d", msg.sender_id)
+                await self._platform.send_text(
+                    msg.chat_id, msg.chat_type, "Gateway unlocked."
+                )
+                return
+            if is_admin:
+                await self._platform.send_text(
+                    msg.chat_id,
+                    msg.chat_type,
+                    "Gateway is locked. Use /unlock to resume.",
+                )
             return
 
         # Security gate
@@ -200,6 +221,33 @@ class Gateway:
         from dataclasses import replace
         new_msg = replace(msg, text=payload)
         await self._enqueue(new_msg)
+
+    # ── /kill callback from CommandHandler ───────────────────────
+
+    async def _handle_kill(self, msg: Message) -> None:
+        """Emergency stop: interrupt all running agents and lock gateway."""
+        self._locked = True
+        logger.warning("KILL issued by admin %d — locking gateway", msg.sender_id)
+
+        # Cancel all debounce timers and queued messages
+        for t in list(self._timers.values()):
+            t.cancel()
+        self._timers.clear()
+        self._queues.clear()
+
+        # Interrupt all running agents
+        if self._agent is not None and hasattr(self._agent, "shutdown"):
+            try:
+                await self._agent.shutdown(grace=2.0)
+            except Exception:
+                logger.exception("Error during kill shutdown")
+
+        self._busy_since.clear()
+
+        await self._platform.send_text(
+            msg.chat_id, msg.chat_type,
+            "All agents killed. Gateway locked.\nUse /unlock to resume.",
+        )
 
     # ── debounce & process ──────────────────────────────────────
 
@@ -307,6 +355,14 @@ class Gateway:
             if p := await self._download_image(url, session_key):
                 img_paths.append(p)
 
+        all_files = [f for m in msgs for f in m.files]
+        file_paths: list[str] = []
+        for entry in all_files:
+            if p := await self._download_file(
+                entry["url"], entry["name"], session_key
+            ):
+                file_paths.append(p)
+
         is_replay = dkey is not None and dkey in self._replay_dkeys
         if is_replay:
             self._replay_dkeys.discard(dkey)
@@ -314,6 +370,7 @@ class Gateway:
         context = PromptContext(
             group_context=group_context,
             image_paths=img_paths,
+            file_paths=file_paths,
             is_replay=is_replay,
         )
         prompt = self._agent.prepare_prompt(user_prompt, context)
@@ -340,6 +397,12 @@ class Gateway:
             if event.kind == "text":
                 segments = self._agent.parse_response(event.text)
                 for seg in segments:
+                    if seg.type == "mute":
+                        if first.chat_type == "group":
+                            self.security.mute_user(
+                                first.chat_id, int(seg.content)
+                            )
+                        continue
                     if seg.type == "text":
                         await self._response.send_segment(
                             seg,
@@ -472,4 +535,39 @@ class Gateway:
             return str(path)
         except Exception:
             logger.exception("Image download failed: %s", url[:120])
+            return None
+
+    async def _download_file(
+        self, url: str, filename: str, session_key: str
+    ) -> str | None:
+        work_dir = self.session_mgr.get_work_dir(session_key)
+        file_dir = work_dir / "files"
+        file_dir.mkdir(exist_ok=True)
+
+        # Deduplicate: prepend timestamp if filename already exists
+        dest = file_dir / filename
+        if dest.exists():
+            ts = int(asyncio.get_event_loop().time() * 1000)
+            dest = file_dir / f"{ts}_{filename}"
+
+        is_local = "://127.0.0.1" in url or "://localhost" in url
+        try:
+            async with aiohttp.ClientSession(
+                trust_env=not is_local
+            ) as sess:
+                async with sess.get(
+                    url, timeout=aiohttp.ClientTimeout(total=120)
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            "File download %d: %s", resp.status, url
+                        )
+                        return None
+                    data = await resp.read()
+
+            dest.write_bytes(data)
+            logger.info("File downloaded: %s (%d bytes)", dest, len(data))
+            return str(dest)
+        except Exception:
+            logger.exception("File download failed: %s", url[:120])
             return None

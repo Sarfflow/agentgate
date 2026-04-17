@@ -156,6 +156,7 @@ class OneBotPlatform:
         # Extract content
         text_parts: list[str] = []
         image_urls: list[str] = []
+        file_entries: list[dict] = []
         reply_context: str | None = None
         for seg in segments:
             if seg["type"] == "text":
@@ -166,6 +167,11 @@ class OneBotPlatform:
                 url = seg["data"].get("url")
                 if url:
                     image_urls.append(url)
+            elif seg["type"] == "file":
+                url = seg["data"].get("url")
+                name = seg["data"].get("file", seg["data"].get("name", "unknown"))
+                if url:
+                    file_entries.append({"name": name, "url": url})
             elif seg["type"] == "reply":
                 reply_id = seg["data"].get("id")
                 if reply_id:
@@ -182,7 +188,7 @@ class OneBotPlatform:
         text = "\n".join(text_parts)
         if reply_context:
             text = f"[用户回复了以下消息]\n{reply_context}\n[回复内容]\n{text}"
-        if not text and not image_urls:
+        if not text and not image_urls and not file_entries:
             return None
 
         chat_id = group_id if msg_type == "group" else user_id
@@ -191,6 +197,7 @@ class OneBotPlatform:
         return Message(
             text=text,
             images=image_urls,
+            files=file_entries,
             sender_id=user_id,
             sender_name=nickname,
             chat_id=chat_id,

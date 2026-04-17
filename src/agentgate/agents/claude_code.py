@@ -21,6 +21,7 @@ from ..types import (
 logger = logging.getLogger(__name__)
 
 _RENDER_RE = re.compile(r"<!--render-->(.*?)<!--/render-->", re.DOTALL)
+_MUTE_RE = re.compile(r"<!--mute:(\d+)-->")
 
 
 class ClaudeCodeAgent:
@@ -472,6 +473,13 @@ class ClaudeCodeAgent:
             )
             parts.append(note)
 
+        if context.file_paths:
+            note = "\n".join(
+                f"[User sent file, saved to: {p}]"
+                for p in context.file_paths
+            )
+            parts.append(note)
+
         return "\n\n".join(p for p in parts if p)
 
     # ── Agent protocol: parse_response ──────────────────────────
@@ -480,13 +488,19 @@ class ClaudeCodeAgent:
         """Parse an assistant text chunk into ResponseSegments.
 
         Splits on <!--SPLIT--> and extracts <!--render--> blocks.
-        Assumes markers are balanced within a single chunk (they are, since
-        a chunk is one assistant LLM turn).
+        Also extracts <!--mute:USER_ID--> directives as "mute" segments.
         """
         if not text:
             return []
 
         segments: list[ResponseSegment] = []
+
+        # Extract mute directives before other parsing
+        mute_ids = _MUTE_RE.findall(text)
+        for uid in mute_ids:
+            segments.append(ResponseSegment("mute", uid))
+        text = _MUTE_RE.sub("", text)
+
         for chunk in text.split("<!--SPLIT-->"):
             chunk = chunk.strip()
             if not chunk:

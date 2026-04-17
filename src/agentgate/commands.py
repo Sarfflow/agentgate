@@ -14,10 +14,12 @@ from .types import Message
 
 logger = logging.getLogger(__name__)
 
-GATEWAY_COMMANDS = {"/new", "/session", "/resume", "/stop", "/help"}
+GATEWAY_COMMANDS = {"/new", "/session", "/resume", "/stop", "/help", "/kill", "/unlock", "/unmute"}
 
 # Callback signature: (original message, payload after /stop) -> None
 StopHandler = Callable[[Message, str], Awaitable[None]]
+# Callback for /kill: (original message) -> None
+KillHandler = Callable[[Message], Awaitable[None]]
 
 # Matches /1, /2, ... /99
 _RESUME_PICK_RE = re.compile(r"^/(\d{1,2})$")
@@ -34,12 +36,14 @@ class CommandHandler:
         security: SecurityChecker,
         agent: Agent | None = None,
         on_stop: StopHandler | None = None,
+        on_kill: KillHandler | None = None,
     ):
         self.platform = platform
         self.session_mgr = session_mgr
         self.security = security
         self.agent = agent
         self._on_stop = on_stop
+        self._on_kill = on_kill
 
         # session_key -> (timestamp, [session_id, ...])
         self._pending_resume: dict[str, tuple[float, list[str]]] = {}
@@ -60,6 +64,19 @@ class CommandHandler:
 
         if cmd == "/stop":
             return await self._handle_stop(msg)
+        if cmd == "/kill":
+            return await self._handle_kill(msg)
+        if cmd == "/unlock":
+            # /unlock is handled directly in gateway.on_message() during lockdown.
+            # If we reach here, gateway is not locked.
+            reply_to = msg.message_id if msg.chat_type == "group" else None
+            await self.platform.send_text(
+                msg.chat_id, msg.chat_type, "Gateway is not locked.",
+                reply_to=reply_to,
+            )
+            return True
+        if cmd == "/unmute":
+            return await self._handle_unmute(msg)
 
         if cmd == "/new":
             if not self.security.is_admin(msg.sender_id):
@@ -81,6 +98,9 @@ class CommandHandler:
                 "/resume — List recent sessions to switch to\n"
                 "/stop — Interrupt current run. `/stop <msg>` interrupts then "
                 "sends msg as the next prompt (admin)\n"
+                "/kill — Emergency stop: kill all agents & lock gateway (admin)\n"
+                "/unlock — Unlock gateway after /kill (admin)\n"
+                "/unmute <user_id> — Unmute a user in current group (admin)\n"
                 "/help — Show help\n"
                 "Other /commands are passed through to the agent"
             )
@@ -252,3 +272,63 @@ class CommandHandler:
             f"Cost: ${cost:.4f}",
         ]
         return "\n".join(lines)
+
+    # ── /kill ───────────────────────────────────────────────────
+
+    async def _handle_kill(self, msg: Message) -> bool:
+        reply_to = msg.message_id if msg.chat_type == "group" else None
+        if not self.security.is_admin(msg.sender_id):
+            await self.platform.send_text(
+                msg.chat_id, msg.chat_type,
+                "Permission denied: admin only.", reply_to=reply_to,
+            )
+            return True
+
+        if self._on_kill:
+            await self._on_kill(msg)
+        return True
+
+    # ── /unmute ─────────────────────────────────────────────────
+
+    async def _handle_unmute(self, msg: Message) -> bool:
+        reply_to = msg.message_id if msg.chat_type == "group" else None
+        if not self.security.is_admin(msg.sender_id):
+            await self.platform.send_text(
+                msg.chat_id, msg.chat_type,
+                "Permission denied: admin only.", reply_to=reply_to,
+            )
+            return True
+
+        parts = msg.text.split()
+        if len(parts) < 2:
+            await self.platform.send_text(
+                msg.chat_id, msg.chat_type,
+                "Usage: /unmute <user_id>", reply_to=reply_to,
+            )
+            return True
+
+        try:
+            target_uid = int(parts[1])
+        except ValueError:
+            await self.platform.send_text(
+                msg.chat_id, msg.chat_type,
+                "Invalid user_id.", reply_to=reply_to,
+            )
+            return True
+
+        group_id = msg.chat_id if msg.chat_type == "group" else None
+        if group_id is None:
+            await self.platform.send_text(
+                msg.chat_id, msg.chat_type,
+                "/unmute only works in group chat.", reply_to=reply_to,
+            )
+            return True
+
+        if self.security.unmute_user(group_id, target_uid):
+            text = f"Unmuted user {target_uid} in this group."
+        else:
+            text = f"User {target_uid} is not muted in this group."
+        await self.platform.send_text(
+            msg.chat_id, msg.chat_type, text, reply_to=reply_to,
+        )
+        return True
