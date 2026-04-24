@@ -4,8 +4,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -14,14 +14,10 @@ from ..types import (
     AgentEvent,
     AgentResult,
     PromptContext,
-    ResponseSegment,
     SessionSummary,
 )
 
 logger = logging.getLogger(__name__)
-
-_RENDER_RE = re.compile(r"<!--render-->(.*?)<!--/render-->", re.DOTALL)
-_MUTE_RE = re.compile(r"<!--mute:(\d+)-->")
 
 
 class ClaudeCodeAgent:
@@ -203,7 +199,7 @@ class ClaudeCodeAgent:
             stderr_task = asyncio.create_task(self._drain_stderr(proc))
 
             try:
-                async for ev in self._stream_events(proc, session_id):
+                async for ev in self._stream_events(proc, session_id, work_dir):
                     yield ev
             except asyncio.CancelledError:
                 # Caller cancelled (shutdown / supersession). Kill and re-raise.
@@ -223,6 +219,7 @@ class ClaudeCodeAgent:
         self,
         proc: asyncio.subprocess.Process,
         fallback_sid: str | None,
+        work_dir: Path,
     ) -> AsyncIterator[AgentEvent]:
         """Read CC's stream-json stdout line by line and yield AgentEvents.
 
@@ -240,6 +237,10 @@ class ClaudeCodeAgent:
         result_error_subtype = ""
         last_assistant_text = ""
         any_text_sent = False
+        # tool_use id -> tool name, for detecting dangling tool_uses (CC CLI
+        # bug where a tool_use is emitted but the tool never runs, leaving
+        # the transcript in a half-broken state on --resume).
+        pending_tool_uses: dict[str, str] = {}
 
         while True:
             try:
@@ -295,6 +296,28 @@ class ClaudeCodeAgent:
                         last_assistant_text = joined
                         any_text_sent = True
                         yield AgentEvent(kind="text", text=joined)
+                    for b in content:
+                        if (
+                            isinstance(b, dict)
+                            and b.get("type") == "tool_use"
+                            and b.get("id")
+                        ):
+                            pending_tool_uses[b["id"]] = (
+                                b.get("name") or "?"
+                            )
+
+            elif evt == "user":
+                # tool_result echoes — clear matching pending tool_use ids.
+                msg = data.get("message") or {}
+                content = msg.get("content") or []
+                if isinstance(content, list):
+                    for b in content:
+                        if (
+                            isinstance(b, dict)
+                            and b.get("type") == "tool_result"
+                            and b.get("tool_use_id")
+                        ):
+                            pending_tool_uses.pop(b["tool_use_id"], None)
 
             elif evt == "result":
                 saw_result = True
@@ -318,6 +341,34 @@ class ClaudeCodeAgent:
                     break
                 # result event is terminal
                 break
+
+        # ── Dangling tool_use repair ───────────────────────────
+        # CC sometimes emits a tool_use then exits without ever running
+        # the tool (native Read on large PDFs is the known offender).
+        # The transcript is left with a tool_use and no matching
+        # tool_result; on --resume CC would normally inject "Continue
+        # from where you left off." / "No response requested." to
+        # paper over it, which eats the next real user turn. We patch
+        # the jsonl with synthetic error tool_results so resume sees a
+        # complete pair and processes the next user message directly.
+        if pending_tool_uses and r.session_id:
+            dangling_names = sorted(set(pending_tool_uses.values()))
+            logger.warning(
+                "Agent ended with %d unresolved tool_use(s) [%s] (sid=%s) — "
+                "patching transcript with synthetic tool_results",
+                len(pending_tool_uses),
+                ", ".join(dangling_names),
+                r.session_id,
+            )
+            try:
+                self._patch_dangling_tool_uses(
+                    work_dir, r.session_id, pending_tool_uses
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to patch dangling tool_uses (sid=%s)",
+                    r.session_id,
+                )
 
         # ── Final disposition ──────────────────────────────────
         if not saw_result:
@@ -363,6 +414,131 @@ class ClaudeCodeAgent:
                     kind="text", text="[Agent returned empty response]"
                 )
         yield AgentEvent(kind="result", result=r)
+
+    @staticmethod
+    def _read_tail(path: Path, max_bytes: int) -> str:
+        """Return the last `max_bytes` of a text file, utf-8-decoded with
+        replacement for any mid-char split at the head."""
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            if size <= max_bytes:
+                f.seek(0)
+            else:
+                f.seek(size - max_bytes)
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
+
+    def _patch_dangling_tool_uses(
+        self,
+        work_dir: Path,
+        session_id: str,
+        pending: dict[str, str],
+    ) -> None:
+        """Append synthetic error tool_results to the CC transcript for
+        tool_uses that never got executed.
+
+        CC stores per-cwd transcripts at
+        ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`` where
+        the encoding replaces every non-alphanumeric char in the
+        absolute cwd with ``-``. Without this patch, the next
+        ``--resume`` on this session would see an unpaired tool_use
+        at the tail and auto-inject a synthetic "Continue from where
+        you left off." / "No response requested." exchange, which
+        silently eats the user's actual next message.
+        """
+        cc_dir = self._get_cc_project_dir(work_dir)
+        if cc_dir is None:
+            logger.warning(
+                "CC project dir not found for %s", work_dir
+            )
+            return
+        jsonl = cc_dir / f"{session_id}.jsonl"
+        if not jsonl.exists():
+            logger.warning(
+                "Transcript not found for patching: %s", jsonl
+            )
+            return
+
+        # Scan the tail of the file to recover chain state (last uuid)
+        # and metadata templates (version, entrypoint) we should echo
+        # into synthetic entries. Long sessions can grow these files to
+        # many MB, so read at most the trailing 64KB — more than enough
+        # to span the last several entries.
+        tail = self._read_tail(jsonl, 65536)
+        last_uuid: str | None = None
+        version = "unknown"
+        entrypoint = "sdk-cli"
+        for line in tail.splitlines():
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                # Partial first line from the tail slice — expected; skip.
+                continue
+            if "uuid" in d:
+                last_uuid = d["uuid"]
+            if d.get("version"):
+                version = d["version"]
+            if d.get("entrypoint"):
+                entrypoint = d["entrypoint"]
+
+        if last_uuid is None:
+            logger.warning(
+                "No uuid chain anchor in transcript %s", jsonl
+            )
+            return
+
+        now = (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+        entries: list[dict] = []
+        for tool_use_id, tool_name in pending.items():
+            new_uuid = str(uuid.uuid4())
+            entries.append(
+                {
+                    "parentUuid": last_uuid,
+                    "isSidechain": False,
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": (
+                                    f"[agentgate] {tool_name} tool call "
+                                    "was terminated before the tool ran "
+                                    "(likely silent CC failure — see "
+                                    "agentgate logs). Do not retry with "
+                                    "the same inputs; try a different "
+                                    "approach."
+                                ),
+                                "is_error": True,
+                            }
+                        ],
+                    },
+                    "uuid": new_uuid,
+                    "timestamp": now,
+                    "userType": "external",
+                    "entrypoint": entrypoint,
+                    "cwd": str(work_dir),
+                    "sessionId": session_id,
+                    "version": version,
+                }
+            )
+            last_uuid = new_uuid
+
+        with jsonl.open("a", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+        logger.info(
+            "Patched %d synthetic tool_result(s) into %s",
+            len(entries),
+            jsonl.name,
+        )
 
     @staticmethod
     async def _drain_stderr(proc: asyncio.subprocess.Process) -> None:
@@ -456,13 +632,7 @@ class ClaudeCodeAgent:
             )
 
         if context.is_replay:
-            parts.append(
-                "[SYSTEM NOTE: agentgate restarted and this message was replayed "
-                "from its persistent inbox. Your previous run (if any) was "
-                "interrupted before it could reply. Check git/filesystem state "
-                "before re-doing any side-effecting work; if the work was "
-                "already completed, just confirm to the user.]"
-            )
+            parts.append("[重启前未完的消息]")
 
         parts.append(user_prompt)
 
@@ -482,39 +652,3 @@ class ClaudeCodeAgent:
 
         return "\n\n".join(p for p in parts if p)
 
-    # ── Agent protocol: parse_response ──────────────────────────
-
-    def parse_response(self, text: str) -> list[ResponseSegment]:
-        """Parse an assistant text chunk into ResponseSegments.
-
-        Splits on <!--SPLIT--> and extracts <!--render--> blocks.
-        Also extracts <!--mute:USER_ID--> directives as "mute" segments.
-        """
-        if not text:
-            return []
-
-        segments: list[ResponseSegment] = []
-
-        # Extract mute directives before other parsing
-        mute_ids = _MUTE_RE.findall(text)
-        for uid in mute_ids:
-            segments.append(ResponseSegment("mute", uid))
-        text = _MUTE_RE.sub("", text)
-
-        for chunk in text.split("<!--SPLIT-->"):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-
-            parts = _RENDER_RE.split(chunk)
-            is_render = False
-            for part in parts:
-                part = part.strip()
-                if not part:
-                    is_render = not is_render
-                    continue
-                seg_type = "render" if is_render else "text"
-                segments.append(ResponseSegment(seg_type, part))
-                is_render = not is_render
-
-        return segments or [ResponseSegment("text", text)]

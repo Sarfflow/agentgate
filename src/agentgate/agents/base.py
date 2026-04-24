@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import AsyncIterator, Protocol, runtime_checkable
 
-from ..types import AgentEvent, PromptContext, ResponseSegment, SessionSummary
+from ..types import AgentEvent, PromptContext, SessionSummary
 
 
 @runtime_checkable
@@ -68,12 +68,3 @@ class Agent(Protocol):
         or has no history on disk.
         """
         return []
-
-    def parse_response(self, text: str) -> list[ResponseSegment]:
-        """Parse raw agent output into typed segments for sending.
-
-        Agents may use conventions like <!--SPLIT--> or <!--render--> blocks
-        to signal how output should be delivered. This method translates
-        those conventions into generic ResponseSegment objects.
-        """
-        ...

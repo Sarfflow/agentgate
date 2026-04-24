@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
+import time
 from pathlib import Path
 
 from .config import Config
 from .types import Message
 
 logger = logging.getLogger(__name__)
+
+# Messages sitting in inbox longer than this (seconds) are dropped on load.
+# Shields against stale entries stranded by prior bugs or long uptimes.
+INBOX_REPLAY_TTL = 300.0
 
 GATEWAY_RULES_TEMPLATE = """\
 # Agent Gateway Rules
@@ -242,11 +247,31 @@ class SessionManager:
             return {}
 
         out: dict[str, list[Message]] = {}
+        now = time.time()
+        dropped = 0
         for dkey, raws in data.get("dkeys", {}).items():
-            msgs = [Message.from_dict(r) for r in raws if isinstance(r, dict)]
-            if msgs:
-                out[dkey] = msgs
+            fresh: list[Message] = []
+            for r in raws:
+                if not isinstance(r, dict):
+                    continue
+                m = Message.from_dict(r)
+                # received_at=0 means the field wasn't populated (pre-upgrade
+                # snapshot). Conservatively treat those as stale — we have no
+                # way to date them and the new code stamps every live message.
+                age = now - m.received_at if m.received_at else float("inf")
+                if age > INBOX_REPLAY_TTL:
+                    dropped += 1
+                    continue
+                fresh.append(m)
+            if fresh:
+                out[dkey] = fresh
         self._inbox_file.unlink(missing_ok=True)
+        if dropped:
+            logger.warning(
+                "Dropped %d stale inbox message(s) older than %.0fs",
+                dropped,
+                INBOX_REPLAY_TTL,
+            )
         if out:
             logger.info(
                 "Loaded inbox snapshot: %d dkeys, %d messages",

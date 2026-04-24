@@ -8,25 +8,6 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# ── markdown detection ──────────────────────────────────────────
-
-_MD_PATTERNS = [
-    re.compile(r"\*\*.+?\*\*"),
-    re.compile(r"(?<!\*)\*(?!\*).+?(?<!\*)\*(?!\*)"),
-    re.compile(r"`.+?`"),
-    re.compile(r"```"),
-    re.compile(r"\$\$.+?\$\$", re.S),
-    re.compile(r"\$[^$\n]+?\$"),
-    re.compile(r"^\s*[-*+] \[[ x]\]", re.M),
-    re.compile(r"^\|.+\|$", re.M),
-    re.compile(r"^#{1,6}\s", re.M),
-]
-
-
-def has_markdown(text: str) -> bool:
-    return any(p.search(text) for p in _MD_PATTERNS)
-
-
 # ── server-side markdown -> HTML ─────────────────────────────────
 
 _ASSETS_DIR = Path(__file__).parent / "assets"

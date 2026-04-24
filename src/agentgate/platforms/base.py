@@ -22,7 +22,7 @@ class ChatPlatform(Protocol):
         chat_type: str,
         text: str,
         reply_to: int | None = None,
-        mention: int | None = None,
+        mentions: list[int] | None = None,
     ) -> None: ...
 
     async def send_image(
@@ -45,11 +45,6 @@ class ChatPlatform(Protocol):
         chat_id: int,
         limit: int = 1000,
     ) -> list[HistoryMessage]: ...
-
-    async def fetch_message(
-        self,
-        message_id: int,
-    ) -> HistoryMessage | None: ...
 
     def get_platform_rules(self) -> str:
         """Return platform-specific instructions for the agent workspace."""

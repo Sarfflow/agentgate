@@ -203,7 +203,6 @@ class OneBotPlatform:
             chat_id=chat_id,
             chat_type=msg_type,
             message_id=int(message_id) if message_id else 0,
-            reply_text=reply_context,
             is_bot_mentioned=is_at or is_reply,
         )
 
@@ -332,13 +331,15 @@ class OneBotPlatform:
         chat_type: str,
         text: str,
         reply_to: int | None = None,
-        mention: int | None = None,
+        mentions: list[int] | None = None,
     ) -> None:
         chain: list[dict] = []
         if chat_type == "group" and reply_to is not None:
             chain.append({"type": "reply", "data": {"id": str(reply_to)}})
-        if mention is not None:
-            chain.append({"type": "at", "data": {"qq": str(mention)}})
+        ats = mentions or []
+        if ats:
+            for qq in ats:
+                chain.append({"type": "at", "data": {"qq": str(qq)}})
             chain.append({"type": "text", "data": {"text": " " + text}})
         else:
             chain.append({"type": "text", "data": {"text": text}})
@@ -472,42 +473,11 @@ class OneBotPlatform:
                     sender_name=sender.get("nickname", "?"),
                     timestamp=raw.get("time", 0),
                     message_id=int(raw.get("message_id", 0)),
-                    is_from_bot=sender_id == self.self_id,
                     mentions_bot=at_bot or reply_to_bot,
                 )
             )
 
         return result
-
-    async def fetch_message(self, message_id: int) -> HistoryMessage | None:
-        data = await self.call_api("get_msg", message_id=message_id)
-        if not data:
-            return None
-        sender = data.get("sender", {})
-        segments = data.get("message", [])
-        text_parts: list[str] = []
-        for seg in segments:
-            if seg.get("type") == "text":
-                t = seg.get("data", {}).get("text", "").strip()
-                if t:
-                    text_parts.append(t)
-            elif seg.get("type") == "image":
-                text_parts.append("[图片]")
-            elif seg.get("type") == "forward":
-                fwd_id = seg.get("data", {}).get("id")
-                if fwd_id:
-                    fwd_lines, _ = await self._expand_forward(fwd_id)
-                    text_parts.append(f"[转发消息 {len(fwd_lines)}条]")
-
-        sender_id = int(sender.get("user_id", 0))
-        return HistoryMessage(
-            text=" ".join(text_parts),
-            sender_id=sender_id,
-            sender_name=sender.get("nickname", str(sender_id)),
-            timestamp=data.get("time", 0),
-            message_id=int(data.get("message_id", 0)),
-            is_from_bot=sender_id == self.self_id,
-        )
 
     def get_platform_rules(self) -> str:
         api = self.config.http_api

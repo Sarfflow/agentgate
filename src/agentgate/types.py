@@ -16,9 +16,9 @@ class Message:
     chat_id: int = 0
     chat_type: str = ""  # "private" or "group"
     message_id: int = 0
-    reply_text: str | None = None
     is_bot_mentioned: bool = False
     is_admin: bool = False
+    received_at: float = 0.0  # unix timestamp; used for inbox TTL on replay
 
     def to_dict(self) -> dict:
         return {
@@ -30,9 +30,9 @@ class Message:
             "chat_id": self.chat_id,
             "chat_type": self.chat_type,
             "message_id": self.message_id,
-            "reply_text": self.reply_text,
             "is_bot_mentioned": self.is_bot_mentioned,
             "is_admin": self.is_admin,
+            "received_at": self.received_at,
         }
 
     @classmethod
@@ -46,9 +46,9 @@ class Message:
             chat_id=int(d.get("chat_id", 0)),
             chat_type=d.get("chat_type", ""),
             message_id=int(d.get("message_id", 0)),
-            reply_text=d.get("reply_text"),
             is_bot_mentioned=bool(d.get("is_bot_mentioned", False)),
             is_admin=bool(d.get("is_admin", False)),
+            received_at=float(d.get("received_at", 0.0)),
         )
 
 
@@ -127,5 +127,4 @@ class HistoryMessage:
     sender_name: str = ""
     timestamp: int = 0
     message_id: int = 0
-    is_from_bot: bool = False
     mentions_bot: bool = False

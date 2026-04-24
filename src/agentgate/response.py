@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from .platforms.base import ChatPlatform
 from .render import render_md_to_png
@@ -10,6 +11,11 @@ from .session import SessionManager
 from .types import ResponseSegment
 
 logger = logging.getLogger(__name__)
+
+# Matches `@<qq>` the agent writes inline to mention additional users. QQ
+# numbers are 5+ digits; trailing space is consumed so the rendered @ node
+# sits cleanly at the start of the chain.
+_AT_RE = re.compile(r"@(\d{5,})\s?")
 
 
 class ResponseSender:
@@ -22,32 +28,6 @@ class ResponseSender:
         self.platform = platform
         self.session_mgr = session_mgr
         self.max_len = max_message_length
-
-    async def send(
-        self,
-        segments: list[ResponseSegment],
-        chat_id: int,
-        chat_type: str,
-        reply_msg_id: int,
-        sender_id: int,
-    ):
-        """Send a batch of segments; first text uses reply_msg_id as reply anchor."""
-        if not segments:
-            return
-
-        first_text = True
-        for i, seg in enumerate(segments):
-            await self.send_segment(
-                seg,
-                chat_id,
-                chat_type,
-                reply_msg_id if (first_text and seg.type == "text") else None,
-                sender_id,
-            )
-            if seg.type == "text":
-                first_text = False
-            if i < len(segments) - 1:
-                await asyncio.sleep(0.5)
 
     async def send_segment(
         self,
@@ -77,13 +57,25 @@ class ResponseSender:
             await self._send_as_forward(text, chat_id, chat_type)
             return
 
-        if chat_type == "group" and reply_msg_id is not None:
+        # Extract any `@<qq>` markers the agent wrote inline — they become
+        # real @-nodes in the message chain (QQ renders them as @nickname).
+        # The leading default @ (last sender in batch) only applies to the
+        # first text segment, i.e. when reply_msg_id is set.
+        if chat_type == "group":
+            extra = [int(m) for m in _AT_RE.findall(text)]
+            clean_text = _AT_RE.sub("", text)
+            mentions: list[int] = []
+            if reply_msg_id is not None:
+                mentions.append(sender_id)
+            for uid in extra:
+                if uid not in mentions:
+                    mentions.append(uid)
             await self.platform.send_text(
                 chat_id,
                 chat_type,
-                text,
+                clean_text,
                 reply_to=reply_msg_id,
-                mention=sender_id,
+                mentions=mentions or None,
             )
         else:
             await self.platform.send_text(chat_id, chat_type, text)

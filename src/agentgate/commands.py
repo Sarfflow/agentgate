@@ -167,13 +167,9 @@ class CommandHandler:
         known = set(self.session_mgr.get_known_sessions(session_key))
         sessions: list = []
         if known:
-            try:
-                sessions = self.agent.list_sessions(
-                    work_dir, limit=10, only_ids=known
-                )
-            except TypeError:
-                # Agent adapter doesn't support only_ids yet
-                sessions = self.agent.list_sessions(work_dir, limit=10)
+            sessions = self.agent.list_sessions(
+                work_dir, limit=10, only_ids=known
+            )
         if not sessions:
             return "No session history found."
 

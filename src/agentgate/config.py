@@ -17,7 +17,6 @@ class OneBotConfig:
 class ClaudeCodeConfig:
     model: str = ""
     max_concurrent: int = 3
-    timeout: int = 1800
     max_budget: float = 0.0
     fallback_model: str = ""
     extra_flags: list[str] = field(default_factory=list)
